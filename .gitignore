@@ -1,0 +1,16 @@
+.idea/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# data and checkpoints
+data/
+checkpoints/
+
+# model/data artifacts
+*.pt
+*.pth
+*.bin
+*.npy
+*.npz
