@@ -13,7 +13,7 @@ from data.data_loader import KGProcessor, TrainDataset
 from models.rotate import RotatEModel
 from models.struct_refiner import StructRefiner
 from models.semantic_biencoder import SemanticBiEncoderScorer
-from models.gate_injector import ConfidenceGate
+from models.gate_injector import ConfidenceGate, entropy_from_logits
 from test_semres import load_embeddings
 
 
@@ -57,15 +57,42 @@ def sem_score_lhs_biencoder_pos(sem_model, ent_embs, rel_embs, t, r, h):
     return (q * v).sum(dim=-1)  # [B]
 
 
-def sample_from_topk(cand_2d: torch.Tensor, k_sample: int):
+def sample_from_topk(cand_2d: torch.Tensor, k_sample: int, prefix_k: int):
     """
     Return sampled candidates AND their indices in the topK list.
+    Strategy: take top prefix_k, and random sample from the rest.
     """
-    if k_sample <= 0 or k_sample >= cand_2d.size(1):
-        idx = torch.arange(cand_2d.size(1), device=cand_2d.device).unsqueeze(0).expand(cand_2d.size(0), -1)
+    B, K = cand_2d.shape
+    if k_sample <= 0 or k_sample >= K:
+        idx = torch.arange(K, device=cand_2d.device).unsqueeze(0).expand(B, -1)
         return cand_2d, idx
-    idx = torch.randint(0, cand_2d.size(1), (cand_2d.size(0), k_sample), device=cand_2d.device)
+
+    prefix_k = max(0, min(prefix_k, k_sample, K))
+    rest_k = k_sample - prefix_k
+
+    if prefix_k > 0:
+        idx_prefix = torch.arange(prefix_k, device=cand_2d.device).unsqueeze(0).expand(B, -1)
+    else:
+        idx_prefix = torch.empty((B, 0), dtype=torch.long, device=cand_2d.device)
+
+    if rest_k > 0 and prefix_k < K:
+        idx_rest = torch.randint(prefix_k, K, (B, rest_k), device=cand_2d.device)
+        idx = torch.cat([idx_prefix, idx_rest], dim=1)
+    else:
+        idx = idx_prefix
+
     return cand_2d.gather(1, idx), idx
+
+
+def pearson_corr(x: torch.Tensor, y: torch.Tensor) -> float:
+    x = x.float()
+    y = y.float()
+    x = x - x.mean()
+    y = y - y.mean()
+    denom = x.std(unbiased=False) * y.std(unbiased=False)
+    if float(denom.item()) < 1e-12:
+        return 0.0
+    return float((x * y).mean().item() / denom.item())
 
 
 def save_args(args, save_dir):
@@ -92,9 +119,16 @@ def main():
     ap.add_argument("--gate_rel_dim", type=int, default=16)
     ap.add_argument("--gate_dir_dim", type=int, default=8)
     ap.add_argument("--gate_hidden_dim", type=int, default=64)
-    ap.add_argument("--gate_g_max", type=float, default=1.0)
+    ap.add_argument("--gate_g_min", type=float, default=0.0)
+    ap.add_argument("--gate_g_max", type=float, default=2.0)
+    ap.add_argument("--gate_init_bias", type=float, default=0.5413)
     ap.add_argument("--gate_ent_temp", type=float, default=1.0)
     ap.add_argument("--lambda_g", type=float, default=0.05)
+    ap.add_argument("--lambda_mono", type=float, default=0.1)
+    ap.add_argument("--lambda_risk", type=float, default=0.05)
+    ap.add_argument("--risk_temp", type=float, default=1.0)
+    ap.add_argument("--sample_prefix_k", type=int, default=64)
+    ap.add_argument("--diag_every", type=int, default=10)
 
     ap.add_argument("--batch_size", type=int, default=256)
     ap.add_argument("--epochs", type=int, default=5)
@@ -164,7 +198,9 @@ def main():
         rel_emb_dim=args.gate_rel_dim,
         dir_emb_dim=args.gate_dir_dim,
         hidden_dim=args.gate_hidden_dim,
+        g_min=args.gate_g_min,
         g_max=args.gate_g_max,
+        init_bias=args.gate_init_bias,
     ).to(device)
 
     opt = optim.AdamW(gate.parameters(), lr=args.lr, weight_decay=args.weight_decay)
@@ -183,6 +219,17 @@ def main():
         loss_sum = 0.0
         g_rhs_sum = 0.0
         g_lhs_sum = 0.0
+        recall_rhs = 0.0
+        recall_lhs = 0.0
+        corr_m12_rhs = 0.0
+        corr_ent_rhs = 0.0
+        corr_m12_lhs = 0.0
+        corr_ent_lhs = 0.0
+        g_pos_rhs = 0.0
+        g_neg_rhs = 0.0
+        g_pos_lhs = 0.0
+        g_neg_lhs = 0.0
+        n_diag = 0
         n_batches = 0
 
         for row_idx in loader:
@@ -217,8 +264,18 @@ def main():
             g_rhs = gate(top_scores_rhs, r, dir0, ent_temp=args.gate_ent_temp)
             g_lhs = gate(top_scores_lhs, r, dir1, ent_temp=args.gate_ent_temp)
 
-            cand_t_s, idx_t = sample_from_topk(cand_t, args.sample_k)
-            cand_h_s, idx_h = sample_from_topk(cand_h, args.sample_k)
+            # monotonic prior: confident -> smaller g
+            m12_rhs = top_scores_rhs[:, 0] - top_scores_rhs[:, 1]
+            m12_lhs = top_scores_lhs[:, 0] - top_scores_lhs[:, 1]
+            perm = torch.randperm(B, device=device)
+            mono_mask_rhs = m12_rhs > m12_rhs[perm]
+            mono_mask_lhs = m12_lhs > m12_lhs[perm]
+            loss_mono_rhs = torch.nn.functional.softplus(g_rhs - g_rhs[perm])[mono_mask_rhs].mean() if mono_mask_rhs.any() else 0.0
+            loss_mono_lhs = torch.nn.functional.softplus(g_lhs - g_lhs[perm])[mono_mask_lhs].mean() if mono_mask_lhs.any() else 0.0
+            loss_mono = loss_mono_rhs + loss_mono_lhs
+
+            cand_t_s, idx_t = sample_from_topk(cand_t, args.sample_k, args.sample_prefix_k)
+            cand_h_s, idx_h = sample_from_topk(cand_h, args.sample_k, args.sample_prefix_k)
 
             with torch.no_grad():
                 sem_topk_rhs = sem_score_rhs_biencoder(sem, ent_embs, rel_embs, h, r, cand_t_s)
@@ -226,6 +283,9 @@ def main():
 
                 sem_topk_lhs = sem_score_lhs_biencoder(sem, ent_embs, rel_embs, t, r, cand_h_s)
                 sem_gold_lhs = sem_score_lhs_biencoder_pos(sem, ent_embs, rel_embs, t, r, h)
+
+                sem_topk_rhs_full = sem_score_rhs_biencoder(sem, ent_embs, rel_embs, h, r, cand_t)
+                sem_topk_lhs_full = sem_score_lhs_biencoder(sem, ent_embs, rel_embs, t, r, cand_h)
 
             top_scores_rhs_s = top_scores_rhs.gather(1, idx_t)
             top_scores_lhs_s = top_scores_lhs.gather(1, idx_h)
@@ -245,7 +305,17 @@ def main():
             loss_rhs = ce(logits_rhs, labels)
             loss_lhs = ce(logits_lhs, labels)
             reg = args.lambda_g * 0.5 * (g_rhs.mean() + g_lhs.mean())
-            loss = loss_rhs + loss_lhs + reg
+            # risk regularizer: penalize gate when sem disagrees with struct
+            T = max(args.risk_temp, 1e-6)
+            p_rhs = torch.softmax(top_scores_rhs / T, dim=1)
+            q_rhs = torch.softmax(sem_topk_rhs_full / T, dim=1)
+            p_lhs = torch.softmax(top_scores_lhs / T, dim=1)
+            q_lhs = torch.softmax(sem_topk_lhs_full / T, dim=1)
+            kl_rhs = (p_rhs * (p_rhs.clamp_min(1e-12).log() - q_rhs.clamp_min(1e-12).log())).sum(dim=1)
+            kl_lhs = (p_lhs * (p_lhs.clamp_min(1e-12).log() - q_lhs.clamp_min(1e-12).log())).sum(dim=1)
+            loss_risk = (g_rhs * kl_rhs).mean() + (g_lhs * kl_lhs).mean()
+
+            loss = loss_rhs + loss_lhs + reg + args.lambda_mono * loss_mono + args.lambda_risk * loss_risk
 
             opt.zero_grad(set_to_none=True)
             loss.backward()
@@ -255,10 +325,61 @@ def main():
             loss_sum += float(loss.item())
             g_rhs_sum += float(g_rhs.mean().item())
             g_lhs_sum += float(g_lhs.mean().item())
+            kth_rhs = top_scores_rhs.min(dim=1).values
+            kth_lhs = top_scores_lhs.min(dim=1).values
+            recall_rhs += float((s_gold_struct_rhs >= kth_rhs).float().mean().item())
+            recall_lhs += float((s_gold_struct_lhs >= kth_lhs).float().mean().item())
             n_batches += 1
 
+            if args.diag_every > 0 and (n_batches % args.diag_every == 0):
+                with torch.no_grad():
+                    m12_rhs = top_scores_rhs[:, 0] - top_scores_rhs[:, 1]
+                    ent_rhs = entropy_from_logits(top_scores_rhs, temp=args.gate_ent_temp)
+                    m12_lhs = top_scores_lhs[:, 0] - top_scores_lhs[:, 1]
+                    ent_lhs = entropy_from_logits(top_scores_lhs, temp=args.gate_ent_temp)
+
+                    corr_m12_rhs += pearson_corr(g_rhs, m12_rhs)
+                    corr_ent_rhs += pearson_corr(g_rhs, ent_rhs)
+                    corr_m12_lhs += pearson_corr(g_lhs, m12_lhs)
+                    corr_ent_lhs += pearson_corr(g_lhs, ent_lhs)
+
+                    # topK rank improvement diagnostic
+                    sem_topk_rhs_full = sem_score_rhs_biencoder(sem, ent_embs, rel_embs, h, r, cand_t)
+                    sem_topk_lhs_full = sem_score_lhs_biencoder(sem, ent_embs, rel_embs, t, r, cand_h)
+                    total_topk_rhs = top_scores_rhs + (args.b_rhs * g_rhs).unsqueeze(1) * sem_topk_rhs_full
+                    total_topk_lhs = top_scores_lhs + (args.b_lhs * g_lhs).unsqueeze(1) * sem_topk_lhs_full
+
+                    s_gold_total_rhs = s_gold_struct_rhs + (args.b_rhs * g_rhs) * sem_gold_rhs
+                    s_gold_total_lhs = s_gold_struct_lhs + (args.b_lhs * g_lhs) * sem_gold_lhs
+
+                    rank_struct_rhs = (top_scores_rhs > s_gold_struct_rhs.unsqueeze(1)).sum(dim=1) + 1
+                    rank_total_rhs = (total_topk_rhs > s_gold_total_rhs.unsqueeze(1)).sum(dim=1) + 1
+                    rank_struct_lhs = (top_scores_lhs > s_gold_struct_lhs.unsqueeze(1)).sum(dim=1) + 1
+                    rank_total_lhs = (total_topk_lhs > s_gold_total_lhs.unsqueeze(1)).sum(dim=1) + 1
+
+                    in_topk_rhs = s_gold_struct_rhs >= top_scores_rhs.min(dim=1).values
+                    in_topk_lhs = s_gold_struct_lhs >= top_scores_lhs.min(dim=1).values
+
+                    delta_rhs = (rank_struct_rhs - rank_total_rhs)
+                    delta_lhs = (rank_struct_lhs - rank_total_lhs)
+
+                    if in_topk_rhs.any():
+                        g_pos_rhs += float(g_rhs[(in_topk_rhs & (delta_rhs > 0))].mean().item()) if (in_topk_rhs & (delta_rhs > 0)).any() else 0.0
+                        g_neg_rhs += float(g_rhs[(in_topk_rhs & (delta_rhs <= 0))].mean().item()) if (in_topk_rhs & (delta_rhs <= 0)).any() else 0.0
+                    if in_topk_lhs.any():
+                        g_pos_lhs += float(g_lhs[(in_topk_lhs & (delta_lhs > 0))].mean().item()) if (in_topk_lhs & (delta_lhs > 0)).any() else 0.0
+                        g_neg_lhs += float(g_lhs[(in_topk_lhs & (delta_lhs <= 0))].mean().item()) if (in_topk_lhs & (delta_lhs <= 0)).any() else 0.0
+
+                    n_diag += 1
+
         print(f"Epoch {ep} | loss={loss_sum/max(1,n_batches):.6f} | "
-              f"g_rhs_mean={g_rhs_sum/max(1,n_batches):.4f} | g_lhs_mean={g_lhs_sum/max(1,n_batches):.4f}")
+              f"g_rhs_mean={g_rhs_sum/max(1,n_batches):.4f} | g_lhs_mean={g_lhs_sum/max(1,n_batches):.4f} | "
+              f"recall@K_rhs={recall_rhs/max(1,n_batches):.4f} | recall@K_lhs={recall_lhs/max(1,n_batches):.4f}")
+        if n_diag > 0:
+            print(f"[Diag] corr(g,m12): rhs={corr_m12_rhs/max(1,n_diag):.4f} lhs={corr_m12_lhs/max(1,n_diag):.4f} | "
+                  f"corr(g,entropy): rhs={corr_ent_rhs/max(1,n_diag):.4f} lhs={corr_ent_lhs/max(1,n_diag):.4f}")
+            print(f"[Diag] g_mean | Δrank>0 vs ≤0: rhs={g_pos_rhs/max(1,n_diag):.4f}/{g_neg_rhs/max(1,n_diag):.4f} "
+                  f"lhs={g_pos_lhs/max(1,n_diag):.4f}/{g_neg_lhs/max(1,n_diag):.4f}")
 
         save_path = os.path.join(args.save_dir, f"gate_ep{ep}.pth")
         torch.save({"state_dict": gate.state_dict(), "args": vars(args)}, save_path)

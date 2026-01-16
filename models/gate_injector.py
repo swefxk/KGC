@@ -34,13 +34,16 @@ class ConfidenceGate(nn.Module):
         rel_emb_dim: int = 16,
         dir_emb_dim: int = 8,
         hidden_dim: int = 64,
-        g_max: float = 1.0,
-        init_bias: float = -5.0,
+        g_min: float = 0.0,
+        g_max: float = 2.0,
+        init_bias: float = 0.5413,  # softplus(init_bias) ~= 1.0
     ):
         super().__init__()
         self.rel_emb = nn.Embedding(num_relations, rel_emb_dim)
         self.dir_emb = nn.Embedding(2, dir_emb_dim)
+        self.g_min = float(g_min)
         self.g_max = float(g_max)
+        self.init_bias = float(init_bias)
 
         in_dim = 5 + rel_emb_dim + dir_emb_dim
         self.mlp = nn.Sequential(
@@ -51,10 +54,11 @@ class ConfidenceGate(nn.Module):
 
         # make gate start "almost off"
         nn.init.zeros_(self.mlp[-1].weight)
-        nn.init.constant_(self.mlp[-1].bias, init_bias)
+        nn.init.constant_(self.mlp[-1].bias, 0.0)
 
     def forward(self, top_scores: torch.Tensor, r_ids: torch.Tensor, dir_ids: torch.Tensor, ent_temp: float = 1.0):
         feats = gate_features_from_top_scores(top_scores, ent_temp=ent_temp)  # [B,5]
         x = torch.cat([feats, self.rel_emb(r_ids), self.dir_emb(dir_ids)], dim=1)
-        g = torch.sigmoid(self.mlp(x).squeeze(1))  # [B] in [0,1]
-        return self.g_max * g
+        u = self.mlp(x).squeeze(1)
+        g = F.softplus(u + self.init_bias)
+        return torch.clamp(g, min=self.g_min, max=self.g_max)

@@ -139,7 +139,7 @@ def eval_rhs_topk_inject(
 
         # gold total
         if refiner is None:
-        s_gold_struct = rotate_model(h, r, t, mode="single")  # [B]
+            s_gold_struct = rotate_model(h, r, t, mode="single")  # [B]
         else:
             anchor_emb = refiner.refine_anchor(
                 h, rotate_model, nbr_ent, nbr_rel, nbr_dir, nbr_mask, freq
@@ -169,7 +169,7 @@ def eval_rhs_topk_inject(
 
             # struct scores for this chunk: [B,C]
             if refiner is None:
-            s_chunk = rotate_model(h, r, cand_1d, mode="batch_neg")
+                s_chunk = rotate_model(h, r, cand_1d, mode="batch_neg")
             else:
                 anchor_emb = refiner.refine_anchor(
                     h, rotate_model, nbr_ent, nbr_rel, nbr_dir, nbr_mask, freq
@@ -177,10 +177,10 @@ def eval_rhs_topk_inject(
                 conj_flag = torch.zeros(B, dtype=torch.bool, device=device)
                 s_chunk = rotate_model.score_from_head_emb(anchor_emb, r, cand_1d, conj=conj_flag)
 
-            # --- filtered mask for rank counting (exclude gold) ---
-            comp = s_chunk > s_gold_total.unsqueeze(1)
-            mask = torch.zeros_like(comp, dtype=torch.bool)
+            # --- topK maintenance: exclude filtered + exclude gold ---
+            s_for_topk = s_chunk.clone()
 
+            # mask filtered (including gold for safety)
             rows, cols = [], []
             for i in range(B):
                 filt_sorted = rhs_filters_sorted[i]
@@ -196,15 +196,8 @@ def eval_rhs_topk_inject(
                     rows.append(i)
                     cols.append(fid - start)
             if rows:
+                mask = torch.zeros((B, cand_1d.size(0)), device=device, dtype=torch.bool)
                 mask[rows, cols] = True
-
-            greater_struct += (comp & (~mask)).sum(dim=1)
-
-            # --- topK maintenance: exclude filtered + exclude gold ---
-            s_for_topk = s_chunk.clone()
-
-            # mask filtered (including gold for safety)
-            if rows:
                 s_for_topk = s_for_topk.masked_fill(mask, -1e9)
 
             # mask gold itself
@@ -400,10 +393,10 @@ def eval_lhs_topk_inject(
                 conj_flag = torch.ones(B, dtype=torch.bool, device=device)
                 s_chunk = rotate_model.score_from_head_emb(anchor_emb, r, cand_1d, conj=conj_flag)
 
-            # --- filtered mask for rank counting (exclude gold) ---
-            comp = s_chunk > s_gold_total.unsqueeze(1)
-            mask = torch.zeros_like(comp, dtype=torch.bool)
+            # --- topK maintenance: exclude filtered + exclude gold ---
+            s_for_topk = s_chunk.clone()
 
+            # mask filtered (including gold for safety)
             rows, cols = [], []
             for i in range(B):
                 filt_sorted = lhs_filters_sorted[i]
@@ -419,15 +412,8 @@ def eval_lhs_topk_inject(
                     rows.append(i)
                     cols.append(fid - start)
             if rows:
+                mask = torch.zeros((B, cand_1d.size(0)), device=device, dtype=torch.bool)
                 mask[rows, cols] = True
-
-            greater_struct += (comp & (~mask)).sum(dim=1)
-
-            # --- topK maintenance: exclude filtered + exclude gold ---
-            s_for_topk = s_chunk.clone()
-
-            # mask filtered (including gold for safety)
-            if rows:
                 s_for_topk = s_for_topk.masked_fill(mask, -1e9)
 
             # mask gold itself
@@ -563,7 +549,9 @@ def main():
     ap.add_argument("--gate_rel_dim", type=int, default=16)
     ap.add_argument("--gate_dir_dim", type=int, default=8)
     ap.add_argument("--gate_hidden_dim", type=int, default=64)
-    ap.add_argument("--gate_g_max", type=float, default=1.0)
+    ap.add_argument("--gate_g_min", type=float, default=0.0)
+    ap.add_argument("--gate_g_max", type=float, default=2.0)
+    ap.add_argument("--gate_init_bias", type=float, default=0.5413)
     ap.add_argument("--gate_ent_temp", type=float, default=1.0)
 
     ap.add_argument("--calib_path", type=str, default=None)
@@ -613,7 +601,9 @@ def main():
             rel_emb_dim=args.gate_rel_dim,
             dir_emb_dim=args.gate_dir_dim,
             hidden_dim=args.gate_hidden_dim,
+            g_min=args.gate_g_min,
             g_max=args.gate_g_max,
+            init_bias=args.gate_init_bias,
         ).to(device)
         gate_ckpt = torch.load(args.pretrained_gate, map_location="cpu")
         if isinstance(gate_ckpt, dict) and "state_dict" in gate_ckpt:
