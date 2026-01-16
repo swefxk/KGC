@@ -43,6 +43,8 @@ class SemanticBiEncoderScorer(nn.Module):
 
         self.ent_proj = MLP(self.text_dim, self.proj_dim, h, dropout)
         self.rel_proj = MLP(self.text_dim, self.proj_dim, h, dropout)
+        self.dir_emb = nn.Embedding(2, self.text_dim)
+        nn.init.zeros_(self.dir_emb.weight)
 
         self.q_fuse = nn.Sequential(
             nn.Linear(self.proj_dim * 4, h),
@@ -65,15 +67,26 @@ class SemanticBiEncoderScorer(nn.Module):
         v = self.rel_proj(r)
         return F.normalize(v, p=2, dim=-1)
 
-    def encode_query(self, anchor_txt: torch.Tensor, rel_txt: torch.Tensor) -> torch.Tensor:
+    def encode_query(self, anchor_txt: torch.Tensor, rel_txt: torch.Tensor, dir_ids: torch.Tensor = None) -> torch.Tensor:
         a = self.encode_entity(anchor_txt)
-        r = self.encode_relation(rel_txt)
+        if dir_ids is None:
+            r_txt = rel_txt
+        else:
+            r_txt = rel_txt + self.dir_emb(dir_ids.to(rel_txt.device))
+        r = self.encode_relation(r_txt)
         feat = torch.cat([a, r, a * r, a - r], dim=-1)
         q = self.q_fuse(feat)
         return F.normalize(q, p=2, dim=-1)
 
-    def forward(self, h_txt: torch.Tensor, r_txt: torch.Tensor, t_txt: torch.Tensor, r_ids: torch.Tensor):
-        q = self.encode_query(h_txt, r_txt)
+    def forward(
+        self,
+        h_txt: torch.Tensor,
+        r_txt: torch.Tensor,
+        t_txt: torch.Tensor,
+        r_ids: torch.Tensor = None,
+        dir_ids: torch.Tensor = None,
+    ):
+        q = self.encode_query(h_txt, r_txt, dir_ids=dir_ids)
         v = self.encode_entity(t_txt)
         delta = (q * v).sum(dim=-1)
         lam = torch.ones_like(delta)

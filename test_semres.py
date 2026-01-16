@@ -579,7 +579,11 @@ def main():
             # case B: old semres state_dict
             if isinstance(ckpt, dict) and "state_dict" in ckpt:
                 ckpt = ckpt["state_dict"]
-            semres_model = SemanticResidualScorerV2(ent_embs.size(1), processor.num_relations, args.lambda_sem).to(device)
+            semres_model = SemanticResidualScorerV2(
+                ent_embs.size(1),
+                processor.num_relations,
+                args.lambda_sem,
+            ).to(device)
             semres_model.load_state_dict(ckpt, strict=True)
 
     split_triplets = processor.valid_triplets if args.eval_split == "valid" else processor.test_triplets

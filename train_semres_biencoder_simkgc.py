@@ -162,8 +162,11 @@ def main():
 
     ap.add_argument("--data_path", type=str, default="data/fb15k_custom")
     ap.add_argument("--pretrained_rotate", type=str, required=True)
-    ap.add_argument("--train_cache", type=str, required=True)
+    ap.add_argument("--train_cache", type=str, default=None)  # legacy RHS cache
+    ap.add_argument("--train_cache_rhs", type=str, default=None)
+    ap.add_argument("--train_cache_lhs", type=str, default=None)
     ap.add_argument("--save_dir", type=str, required=True)
+    ap.add_argument("--pretrained_sem", type=str, default=None)
 
     # bi-encoder
     ap.add_argument("--proj_dim", type=int, default=256)
@@ -176,6 +179,8 @@ def main():
     ap.add_argument("--use_inbatch", action="store_true")
     ap.add_argument("--queue_size", type=int, default=4096)
     ap.add_argument("--max_forb", type=int, default=64)  # cap tails per (h,r) when masking
+    ap.add_argument("--disable_true_tail_mask", action="store_true")
+    ap.add_argument("--loss_lhs_weight", type=float, default=1.0)
 
     # train
     ap.add_argument("--batch_size", type=int, default=256)
@@ -206,8 +211,10 @@ def main():
 
     # true tails for masking (train only)
     # train+valid truths for masking (avoid false negatives from valid)
-    to_skip_tv = build_to_skip(processor, split="valid")
-    true_tails = {k: sorted(list(v)) for k, v in to_skip_tv["rhs"].items()}
+    true_tails = None
+    if not args.disable_true_tail_mask:
+        to_skip_tv = build_to_skip(processor, split="valid")
+        true_tails = {k: sorted(list(v)) for k, v in to_skip_tv["rhs"].items()}
 
     g = torch.Generator()
     g.manual_seed(args.seed)
@@ -235,12 +242,24 @@ def main():
     )
 
     # ---- cache (CPU!) ----
-    cache = torch.load(args.train_cache, map_location="cpu")
+    cache_rhs_path = args.train_cache_rhs or args.train_cache
+    if not cache_rhs_path:
+        raise ValueError("Need --train_cache_rhs (or legacy --train_cache).")
+    cache = torch.load(cache_rhs_path, map_location="cpu")
     cache_neg_t = cache["neg_t"] if isinstance(cache, dict) and "neg_t" in cache else cache
     cache_neg_t = cache_neg_t.to(torch.long).contiguous()  # CPU
     if cache_neg_t.size(0) != processor.train_triplets.size(0):
-        raise ValueError(f"Cache rows={cache_neg_t.size(0)} != num_train={processor.train_triplets.size(0)}")
+        raise ValueError(f"RHS cache rows={cache_neg_t.size(0)} != num_train={processor.train_triplets.size(0)}")
     print(f"[Cache] neg_t CPU: {tuple(cache_neg_t.shape)} dtype={cache_neg_t.dtype}")
+
+    cache_neg_h = None
+    if args.train_cache_lhs:
+        cache_h = torch.load(args.train_cache_lhs, map_location="cpu")
+        cache_neg_h = cache_h["neg_h"] if isinstance(cache_h, dict) and "neg_h" in cache_h else cache_h
+        cache_neg_h = cache_neg_h.to(torch.long).contiguous()
+        if cache_neg_h.size(0) != processor.train_triplets.size(0):
+            raise ValueError(f"LHS cache rows={cache_neg_h.size(0)} != num_train={processor.train_triplets.size(0)}")
+        print(f"[Cache] neg_h CPU: {tuple(cache_neg_h.shape)} dtype={cache_neg_h.dtype}")
 
     # ---- RotatE (frozen, for eval only) ----
     rotate_model = RotatEModel(processor.num_entities, processor.num_relations, emb_dim=500, margin=9.0).to(device)
@@ -262,6 +281,11 @@ def main():
         dropout=args.dropout,
         text_norm=args.text_norm,
     ).to(device)
+    if args.pretrained_sem:
+        ckpt = torch.load(args.pretrained_sem, map_location="cpu")
+        if isinstance(ckpt, dict) and "state_dict" in ckpt:
+            ckpt = ckpt["state_dict"]
+        sem_model.load_state_dict(ckpt, strict=False)
 
     optimizer = optim.AdamW(sem_model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scaler = torch.cuda.amp.GradScaler(enabled=args.amp)
@@ -284,6 +308,8 @@ def main():
         stat_margin = 0.0
         stat_p_hard = 0.0
         stat_margin_hard = 0.0
+        stat_p_lhs = 0.0
+        stat_margin_lhs = 0.0
         stat_cnt = 0
 
         for triples, row_idx in train_loader:
@@ -306,7 +332,7 @@ def main():
                 r_txt = rel_embs[r]
                 t_txt = ent_embs[t]
 
-                q = sem_model.encode_query(h_txt, r_txt)          # [B,d]
+                q = sem_model.encode_query(h_txt, r_txt, dir_ids=torch.zeros_like(h))  # [B,d]
                 pos_v = sem_model.encode_entity(t_txt)            # [B,d]
                 pos_logit = (q * pos_v).sum(dim=-1)               # [B]
 
@@ -338,6 +364,8 @@ def main():
                         queue_logits = q @ q_vecs.t()  # [B,Q]
 
                 # ---- false-negative mask (train true tails) ----
+                forb = forb_mask = None
+                if true_tails is not None:
                 forb, forb_mask = make_forbidden_padded(h, r, true_tails, device=device, max_forb=args.max_forb)
                 if forb is not None:
                     # mask hard
@@ -373,6 +401,19 @@ def main():
 
                 loss = ce(logits, labels)
 
+                # ---- optional LHS (hard-only) ----
+                if cache_neg_h is not None:
+                    hard_h_cpu = sample_hard_from_cache_cpu(cache_neg_h, row_idx_cpu, args.hard_k)
+                    hard_h = hard_h_cpu.to(device, non_blocking=True)
+                    q_lhs = sem_model.encode_query(t_txt, r_txt, dir_ids=torch.ones_like(h))  # [B,d]
+                    pos_v_lhs = sem_model.encode_entity(h_txt)
+                    pos_logit_lhs = (q_lhs * pos_v_lhs).sum(dim=-1)  # [B]
+                    hard_v_lhs = sem_model.encode_entity(ent_embs[hard_h.reshape(-1)]).view(B, Kh, -1)
+                    hard_logits_lhs = torch.einsum("bd,bkd->bk", q_lhs, hard_v_lhs)
+                    logits_lhs = torch.cat([pos_logit_lhs.unsqueeze(1), hard_logits_lhs], dim=1) / tau
+                    loss_lhs = ce(logits_lhs, labels)
+                    loss = loss + args.loss_lhs_weight * loss_lhs
+
             scaler.scale(loss).backward()
             if args.grad_clip and args.grad_clip > 0:
                 scaler.unscale_(optimizer)
@@ -400,6 +441,12 @@ def main():
                 stat_margin += m
                 stat_p_hard += p_hard
                 stat_margin_hard += m_hard
+                if cache_neg_h is not None:
+                    neg_max_hard_lhs = hard_logits_lhs.max(dim=1).values
+                    p_hard_lhs = (pos_logit_lhs > neg_max_hard_lhs).float().mean().item()
+                    m_hard_lhs = (pos_logit_lhs - neg_max_hard_lhs).mean().item()
+                    stat_p_lhs += p_hard_lhs
+                    stat_margin_lhs += m_hard_lhs
                 stat_cnt += 1
 
             # enqueue after update (no grad)
@@ -407,9 +454,13 @@ def main():
                 with torch.no_grad():
                     queue.enqueue(t.detach(), pos_v.detach())
 
-        print(f"Epoch {epoch} | loss={total_loss/max(1,n_steps):.6f} | "
-              f"p(pos>maxneg)={stat_p/max(1,stat_cnt):.4f} | margin={stat_margin/max(1,stat_cnt):.4f} | "
-              f"p_hard={stat_p_hard/max(1,stat_cnt):.4f} | margin_hard={stat_margin_hard/max(1,stat_cnt):.4f}")
+        msg = (f"Epoch {epoch} | loss={total_loss/max(1,n_steps):.6f} | "
+               f"p(pos>maxneg)={stat_p/max(1,stat_cnt):.4f} | margin={stat_margin/max(1,stat_cnt):.4f} | "
+               f"p_hard={stat_p_hard/max(1,stat_cnt):.4f} | margin_hard={stat_margin_hard/max(1,stat_cnt):.4f}")
+        if cache_neg_h is not None:
+            msg += (f" | p_hard_lhs={stat_p_lhs/max(1,stat_cnt):.4f} | "
+                    f"margin_hard_lhs={stat_margin_lhs/max(1,stat_cnt):.4f}")
+        print(msg)
 
         # ---- Eval (full-entity filtered, but recommend sem_rhs_only during this phase) ----
         if args.eval_every and (epoch % args.eval_every == 0):
