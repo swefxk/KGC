@@ -584,7 +584,10 @@ def eval_lhs_topk_inject(
     diag = {"delta_rank_sum": 0.0, "p_improve": 0.0, "p_hurt": 0.0,
             "fix_num": 0.0, "fix_den": 0.0, "break_num": 0.0, "break_den": 0.0,
             "delta_gold_sum": 0.0, "gate_on_sum": 0.0, "gate_on_den": 0.0,
-            "rec_num": 0.0, "rec_den": 0.0, "n": 0}
+            "rec_num": 0.0, "rec_den": 0.0, "n": 0,
+            "flip_num": 0.0, "flip_den": 0.0,
+            "p_up_num": 0.0, "p_up_den": 0.0,
+            "p_pair_sum": 0.0, "p_pair_den": 0.0}
     ranks_all = [] if collect_ranks else None
     time_stats = {"struct_topk": 0.0, "sem": 0.0, "refiner": 0.0, "pass2": 0.0} if profile_time else None
 
@@ -887,7 +890,16 @@ def load_sem_model(ckpt_path, text_dim, num_relations, device):
             dropout=cfg.get("dropout", 0.1),
             text_norm=cfg.get("text_norm", True),
         ).to(device)
-        model.load_state_dict(ckpt["state_dict"], strict=True)
+        try:
+            model.load_state_dict(ckpt["state_dict"], strict=True)
+        except RuntimeError:
+            incompatible = model.load_state_dict(ckpt["state_dict"], strict=False)
+            missing = set(incompatible.missing_keys)
+            unexpected = set(incompatible.unexpected_keys)
+            if missing.issubset({"dir_emb.weight"}) and not unexpected:
+                print("[WARN] Sem ckpt missing dir_emb.weight; using default init for dir_emb.")
+            else:
+                raise
         return model
     raise ValueError("This eval script expects a biencoder checkpoint with model_type='biencoder'.")
 
