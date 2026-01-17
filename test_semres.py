@@ -149,6 +149,8 @@ def eval_chunked_bidirectional(
         disable_semres=False,
         sem_rhs_only=False,
         sem_lhs_only=False,
+        refiner_topk_only=False,
+        refiner_topk=500,
         print_sem_stats=False,
         verbose_every=50,
 ):
@@ -165,6 +167,10 @@ def eval_chunked_bidirectional(
 
     if sem_rhs_only and sem_lhs_only:
         raise ValueError("Cannot set both sem_rhs_only and sem_lhs_only.")
+    if refiner_topk_only and refiner is None:
+        raise ValueError("refiner_topk_only requires refiner.")
+    if refiner_topk_only and semres_model is not None:
+        raise ValueError("refiner_topk_only is for refiner-only evaluation; disable semres.")
 
     apply_sem_rhs = (semres_model is not None) and (not sem_lhs_only)
     apply_sem_lhs = (semres_model is not None) and (not sem_rhs_only)
@@ -299,12 +305,19 @@ def eval_chunked_bidirectional(
         # ======================
         # RHS: predict t
         # ======================
-        anchor_emb = get_anchor_emb(h)
+        if refiner_topk_only:
+            anchor_emb = rotate_model.entity_embedding[h]
+            anchor_ref = refiner.refine_anchor(h, rotate_model, nbr_ent, nbr_rel, nbr_dir, nbr_mask, freq)
+        else:
+            anchor_emb = get_anchor_emb(h)
         conj_flag = torch.zeros(B, dtype=torch.bool, device=device)
 
         # gold
         s_gold_struct = rotate_model.score_from_head_emb(anchor_emb, r, t.unsqueeze(1), conj=conj_flag).squeeze(1)
-        s_gold = s_gold_struct
+        if refiner_topk_only:
+            s_gold = rotate_model.score_from_head_emb(anchor_ref, r, t.unsqueeze(1), conj=conj_flag).squeeze(1)
+        else:
+            s_gold = s_gold_struct
 
         if apply_sem_rhs:
             delta_g, lam_g, s_gold_sem = sem_forward(h, r, t, r)
@@ -319,6 +332,9 @@ def eval_chunked_bidirectional(
             rhs_filters_sorted.append(sorted(list(filt)))
 
         greater = torch.zeros(B, dtype=torch.long, device=device)
+        if refiner_topk_only:
+            top_scores = torch.full((B, refiner_topk), -1e9, device=device)
+            top_ids = torch.full((B, refiner_topk), -1, device=device, dtype=torch.long)
 
         first_chunk_struct = None
         first_chunk_sem = None
@@ -375,17 +391,45 @@ def eval_chunked_bidirectional(
 
             greater += (comp & (~mask)).sum(dim=1)
 
-        rank = greater + 1
+            if refiner_topk_only:
+                # exclude filtered + gold from topK candidates
+                if rows:
+                    s_chunk_struct = s_chunk_struct.masked_fill(mask, -1e9)
+                # mask gold
+                for i in range(B):
+                    gold_id = t_cpu[i]
+                    if start <= gold_id < end:
+                        s_chunk_struct[i, gold_id - start] = -1e9
+
+                merged_scores = torch.cat([top_scores, s_chunk_struct], dim=1)
+                merged_ids = torch.cat([top_ids, cand.unsqueeze(0).expand(B, -1)], dim=1)
+                top_scores, idx = torch.topk(merged_scores, k=refiner_topk, dim=1)
+                top_ids = torch.gather(merged_ids, 1, idx)
+
+        if refiner_topk_only:
+            top_scores_ref = rotate_model.score_from_head_emb(anchor_ref, r, top_ids, conj=conj_flag)
+            greater_struct_topk = (top_scores > s_gold.unsqueeze(1)).sum(dim=1)
+            greater_ref_topk = (top_scores_ref > s_gold.unsqueeze(1)).sum(dim=1)
+            rank = greater - greater_struct_topk + greater_ref_topk + 1
+        else:
+            rank = greater + 1
         update_stats("rhs", rank, t)
 
         # ======================
         # LHS: predict h
         # ======================
-        anchor_emb = get_anchor_emb(t)
+        if refiner_topk_only:
+            anchor_emb = rotate_model.entity_embedding[t]
+            anchor_ref = refiner.refine_anchor(t, rotate_model, nbr_ent, nbr_rel, nbr_dir, nbr_mask, freq)
+        else:
+            anchor_emb = get_anchor_emb(t)
         conj_flag = torch.ones(B, dtype=torch.bool, device=device)
 
         s_gold_struct = rotate_model.score_from_head_emb(anchor_emb, r, h.unsqueeze(1), conj=conj_flag).squeeze(1)
-        s_gold = s_gold_struct
+        if refiner_topk_only:
+            s_gold = rotate_model.score_from_head_emb(anchor_ref, r, h.unsqueeze(1), conj=conj_flag).squeeze(1)
+        else:
+            s_gold = s_gold_struct
 
         if apply_sem_lhs:
             # NOTE: sem model still uses (h,r,t) triple; here gold is same triple, only prediction side changes.
@@ -400,6 +444,9 @@ def eval_chunked_bidirectional(
             lhs_filters_sorted.append(sorted(list(filt)))
 
         greater = torch.zeros(B, dtype=torch.long, device=device)
+        if refiner_topk_only:
+            top_scores = torch.full((B, refiner_topk), -1e9, device=device)
+            top_ids = torch.full((B, refiner_topk), -1, device=device, dtype=torch.long)
 
         for start in range(0, num_ent, chunk_size):
             end = min(start + chunk_size, num_ent)
@@ -449,7 +496,26 @@ def eval_chunked_bidirectional(
 
             greater += (comp & (~mask)).sum(dim=1)
 
-        rank = greater + 1
+            if refiner_topk_only:
+                if rows:
+                    s_chunk_struct = s_chunk_struct.masked_fill(mask, -1e9)
+                for i in range(B):
+                    gold_id = h_cpu[i]
+                    if start <= gold_id < end:
+                        s_chunk_struct[i, gold_id - start] = -1e9
+
+                merged_scores = torch.cat([top_scores, s_chunk_struct], dim=1)
+                merged_ids = torch.cat([top_ids, cand.unsqueeze(0).expand(B, -1)], dim=1)
+                top_scores, idx = torch.topk(merged_scores, k=refiner_topk, dim=1)
+                top_ids = torch.gather(merged_ids, 1, idx)
+
+        if refiner_topk_only:
+            top_scores_ref = rotate_model.score_from_head_emb(anchor_ref, r, top_ids, conj=conj_flag)
+            greater_struct_topk = (top_scores > s_gold.unsqueeze(1)).sum(dim=1)
+            greater_ref_topk = (top_scores_ref > s_gold.unsqueeze(1)).sum(dim=1)
+            rank = greater - greater_struct_topk + greater_ref_topk + 1
+        else:
+            rank = greater + 1
         update_stats("lhs", rank, h)
 
         if verbose_every and (b_idx + 1) % verbose_every == 0:
@@ -519,6 +585,9 @@ def main():
     parser.add_argument("--sem_rhs_only", action="store_true")
     parser.add_argument("--sem_lhs_only", action="store_true")
     parser.add_argument("--print_sem_stats", action="store_true")
+    parser.add_argument("--refiner_topk_only", action="store_true",
+                        help="apply refiner only within topK; full-entity rank uses base RotatE")
+    parser.add_argument("--refiner_topk", type=int, default=500)
 
     parser.add_argument("--eval_split", type=str, default="test", choices=["valid", "test"])
 
@@ -554,8 +623,12 @@ def main():
     refiner = None
     if args.pretrained_refiner and not args.disable_refiner:
         print(f"Loading StructRefiner: {args.pretrained_refiner}")
-        refiner = StructRefiner(args.emb_dim, args.K).to(device)
-        refiner.load_state_dict(torch.load(args.pretrained_refiner, map_location=device))
+        refiner = StructRefiner(
+            emb_dim=args.emb_dim,
+            K=args.K,
+            num_relations=processor.num_relations,
+        ).to(device)
+        refiner.load_state_dict(torch.load(args.pretrained_refiner, map_location=device), strict=False)
 
     semres_model = None
     ent_embs, rel_embs = None, None
@@ -614,6 +687,8 @@ def main():
         disable_semres=args.disable_semres,
         sem_rhs_only=args.sem_rhs_only,
         sem_lhs_only=args.sem_lhs_only,
+        refiner_topk_only=args.refiner_topk_only,
+        refiner_topk=args.refiner_topk,
         print_sem_stats=args.print_sem_stats,
     )
 

@@ -163,8 +163,12 @@ def main():
     refiner = None
     nbr_ent = nbr_rel = nbr_dir = nbr_mask = freq = None
     if args.pretrained_refiner:
-        refiner = StructRefiner(emb_dim=500, K=16).to(device)
-        refiner.load_state_dict(torch.load(args.pretrained_refiner, map_location=device))
+            refiner = StructRefiner(
+                emb_dim=500,
+                K=16,
+                num_relations=processor.num_relations,
+            ).to(device)
+            refiner.load_state_dict(torch.load(args.pretrained_refiner, map_location=device), strict=False)
         refiner.eval()
         for p in refiner.parameters():
             p.requires_grad = False

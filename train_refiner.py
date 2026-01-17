@@ -7,7 +7,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Dataset
 
 sys.path.append(os.getcwd())
 
@@ -101,6 +101,51 @@ def _sample_one_filtered(num_entities: int, num_neg: int, target: int, forbidden
 
     out = np.concatenate(negs, axis=0)[:num_neg]
     return out
+
+
+def sample_from_topk(cand_2d: torch.Tensor, k_sample: int, prefix_k: int):
+    """
+    Sample k_sample negatives from cand_2d [B,K_full], taking prefix_k from the beginning
+    and the rest randomly from the remainder.
+    Returns sampled candidates and their indices in the full array.
+    """
+    B, K_full = cand_2d.shape
+    if k_sample <= 0:
+        empty = torch.empty((B, 0), dtype=cand_2d.dtype, device=cand_2d.device)
+        empty_idx = torch.empty((B, 0), dtype=torch.long, device=cand_2d.device)
+        return empty, empty_idx
+
+    if k_sample >= K_full:
+        idx = torch.arange(K_full, device=cand_2d.device).unsqueeze(0).expand(B, -1)
+        return cand_2d, idx
+
+    if prefix_k >= k_sample:
+        idx = torch.arange(k_sample, device=cand_2d.device).unsqueeze(0).expand(B, -1)
+        return cand_2d[:, :k_sample], idx
+
+    prefix_idx = torch.arange(prefix_k, device=cand_2d.device).unsqueeze(0).expand(B, -1)
+    prefix_cands = cand_2d[:, :prefix_k]
+
+    remaining_k = k_sample - prefix_k
+    remaining_pool_size = K_full - prefix_k
+    rand_offset = torch.randint(0, remaining_pool_size, (B, remaining_k), device=cand_2d.device)
+    rand_idx = prefix_k + rand_offset
+    rand_cands = cand_2d.gather(1, rand_idx)
+
+    combined_cands = torch.cat([prefix_cands, rand_cands], dim=1)
+    combined_idx = torch.cat([prefix_idx, rand_idx], dim=1)
+    return combined_cands, combined_idx
+
+
+class IndexDataset(Dataset):
+    def __init__(self, size: int):
+        self.size = size
+
+    def __len__(self):
+        return self.size
+
+    def __getitem__(self, idx):
+        return idx
 
 
 def sample_filtered_negatives_batch(
@@ -265,7 +310,12 @@ def main():
     parser.add_argument("--margin", type=float, default=9.0)
 
     parser.add_argument("--K", type=int, default=16)
-    parser.add_argument("--num_neg", type=int, default=64)
+    parser.add_argument("--num_neg", type=int, default=64, help="used only for random filtered negatives")
+    parser.add_argument("--train_cache_rhs", type=str, default=None, help="RHS hard-neg cache (neg_t)")
+    parser.add_argument("--train_cache_lhs", type=str, default=None, help="LHS hard-neg cache (neg_h)")
+    parser.add_argument("--hard_k", type=int, default=128)
+    parser.add_argument("--sample_prefix_k", type=int, default=64)
+    parser.add_argument("--rand_neg", type=int, default=8)
     parser.add_argument("--neg_oversample", type=int, default=4, help="oversampling factor for filtered negatives")
     parser.add_argument("--batch_size", type=int, default=512)
     parser.add_argument("--epochs", type=int, default=30)
@@ -291,6 +341,18 @@ def main():
     # 可选：限制 eta 无限制变大（默认不加）
     parser.add_argument("--eta_reg_lambda", type=float, default=0.0,
                         help="L2 regularize eta to prevent overly strong refine; set 0 to disable")
+    parser.add_argument("--anchor_reg_lambda", type=float, default=0.0,
+                        help="L2 regularize anchor drift: ||e_ref - e||^2, weighted by freq")
+    parser.add_argument("--eta_floor", type=float, default=None,
+                        help="training-only eta floor to avoid vanishing gradients (e.g., 0.1)")
+    parser.add_argument("--pair_lambda", type=float, default=0.0,
+                        help="pairwise violator loss weight (topK rank-aligned)")
+    parser.add_argument("--logit_temp", type=float, default=1.0)
+    parser.add_argument("--rhs_only", action="store_true", help="train only RHS branch")
+    parser.add_argument("--train_gamma", type=float, default=1.0, help="delta scale during training")
+    parser.add_argument("--viol_tau", type=float, default=0.2, help="temperature for violator loss")
+    parser.add_argument("--lambda_safe", type=float, default=1.0, help="non-violator safety loss weight")
+    parser.add_argument("--lambda_l2", type=float, default=1e-4, help="delta L2 weight")
 
     # 诊断打印频率
     parser.add_argument("--diag_every", type=int, default=1, help="print eta/g stats every N epochs")
@@ -310,7 +372,7 @@ def main():
     processor.nbr_mask = processor.nbr_mask.to(device)
     processor.freq = processor.freq.to(device)
 
-    # train-only 真值集合（用于 filtered negative sampling）
+    # train-only 真值集合（用于 random filtered negatives）
     true_head_train, true_tail_train = build_true_head_tail_from_train(processor.train_triplets)
 
     print(f"Loading frozen RotatE from {args.pretrained_rotate}")
@@ -321,15 +383,30 @@ def main():
     rotate_model.eval()
 
     print("Initializing StructRefiner...")
-    refiner = StructRefiner(emb_dim=args.emb_dim, K=args.K).to(device)
+    refiner = StructRefiner(
+        emb_dim=args.emb_dim,
+        K=args.K,
+        num_relations=processor.num_relations,
+    ).to(device)
     optimizer = optim.Adam(refiner.parameters(), lr=args.lr)
     ce_loss = nn.CrossEntropyLoss()
 
     g = torch.Generator()
     g.manual_seed(args.seed)
 
+    if args.train_cache_rhs and args.train_cache_lhs:
+        rhs_cache = torch.load(args.train_cache_rhs, map_location="cpu")
+        lhs_cache = torch.load(args.train_cache_lhs, map_location="cpu")
+        neg_t_full = (rhs_cache["neg_t"] if isinstance(rhs_cache, dict) else rhs_cache).to(torch.long)
+        neg_h_full = (lhs_cache["neg_h"] if isinstance(lhs_cache, dict) else lhs_cache).to(torch.long)
+        if neg_t_full.size(0) != processor.train_triplets.size(0) or neg_h_full.size(0) != processor.train_triplets.size(0):
+            raise ValueError("Cache rows do not match train size.")
+    else:
+        neg_t_full = None
+        neg_h_full = None
+
     train_loader = DataLoader(
-        TrainDataset(processor.train_triplets),
+        IndexDataset(processor.train_triplets.size(0)),
         batch_size=args.batch_size,
         shuffle=True,
         num_workers=args.num_workers,
@@ -351,51 +428,149 @@ def main():
     for epoch in range(1, args.epochs + 1):
         refiner.train()
         total_loss = 0.0
+        p_pos_gt_maxneg = 0.0
+        margin_sum = 0.0
+        delta_std_sum = 0.0
+        flip_sum = 0.0
+        viol_rate_sum = 0.0
+        fix_rate_sum = 0.0
+        break_rate_sum = 0.0
         n_steps = 0
 
-        for batch in train_loader:
-            batch = batch.to(device, non_blocking=True)
+        for row_idx in train_loader:
+            row_idx_cpu = row_idx
+            batch = processor.train_triplets[row_idx_cpu].to(device, non_blocking=True)
             h, r, t = batch[:, 0], batch[:, 1], batch[:, 2]
             B = h.size(0)
 
+            # Hard negatives from cache (topK) + optional random filtered negatives
+            if neg_t_full is not None and neg_h_full is not None:
+                rhs_cand = neg_t_full[row_idx_cpu].to(device)
+                lhs_cand = neg_h_full[row_idx_cpu].to(device)
+                rhs_hard, _ = sample_from_topk(rhs_cand, args.hard_k, args.sample_prefix_k)
+                lhs_hard, _ = sample_from_topk(lhs_cand, args.hard_k, args.sample_prefix_k)
+            else:
+                rhs_hard = torch.empty((B, 0), dtype=torch.long, device=device)
+                lhs_hard = torch.empty((B, 0), dtype=torch.long, device=device)
+
+            if args.rand_neg > 0:
+                # random filtered negatives (train-only truths)
+                rhs_rand = sample_filtered_negatives_batch(
+                    anchor_ids=h,
+                    rel_ids=r,
+                    target_ids=t,
+                    conj_flag=torch.zeros(B, dtype=torch.bool, device=device),
+                    num_entities=processor.num_entities,
+                    num_neg=args.rand_neg,
+                    true_head_train=true_head_train,
+                    true_tail_train=true_tail_train,
+                    device=device,
+                    oversample=args.neg_oversample
+                )
+                lhs_rand = sample_filtered_negatives_batch(
+                    anchor_ids=t,
+                    rel_ids=r,
+                    target_ids=h,
+                    conj_flag=torch.ones(B, dtype=torch.bool, device=device),
+                    num_entities=processor.num_entities,
+                    num_neg=args.rand_neg,
+                    true_head_train=true_head_train,
+                    true_tail_train=true_tail_train,
+                    device=device,
+                    oversample=args.neg_oversample
+                )
+            else:
+                rhs_rand = torch.empty((B, 0), dtype=torch.long, device=device)
+                lhs_rand = torch.empty((B, 0), dtype=torch.long, device=device)
+
+            rhs_neg = torch.cat([rhs_hard, rhs_rand], dim=1)
+            lhs_neg = torch.cat([lhs_hard, lhs_rand], dim=1)
+
+            if args.rhs_only:
+                anchor_ids = h
+                rel_ids = r
+                target_ids = t
+                neg_ids = rhs_neg
+                conj_flag = torch.zeros(B, dtype=torch.bool, device=device)
+            else:
             # 2B 混合：RHS + LHS
             anchor_ids = torch.cat([h, t], dim=0)  # [2B]
             rel_ids = torch.cat([r, r], dim=0)     # [2B]
             target_ids = torch.cat([t, h], dim=0)  # [2B]
-
+                neg_ids = torch.cat([rhs_neg, lhs_neg], dim=0)  # [2B, Neg]
             conj_flag = torch.cat([
                 torch.zeros(B, dtype=torch.bool, device=device),  # RHS
                 torch.ones(B, dtype=torch.bool, device=device)    # LHS
             ], dim=0)
 
-            anchor_ref = refiner.refine_anchor(
-                anchor_ids, rotate_model,
-                processor.nbr_ent, processor.nbr_rel, processor.nbr_dir, processor.nbr_mask, processor.freq
-            )
+            # base structural scores (RotatE)
+            base_emb = rotate_model.entity_embedding[anchor_ids]
+            s_neg_base = rotate_model.score_from_head_emb(base_emb, rel_ids, neg_ids, conj=conj_flag)
+            s_pos_base = rotate_model.score_from_head_emb(
+                base_emb, rel_ids, target_ids.unsqueeze(1), conj=conj_flag
+            ).squeeze(1)
 
-            # ✅ filtered negatives（train-only）
-            neg_ids = sample_filtered_negatives_batch(
+            # candidate-aware delta (refiner reranking)
+            cand_ids = torch.cat([target_ids.unsqueeze(1), neg_ids], dim=1)  # [2B,1+Neg]
+            delta_ref = refiner.score_delta_topk(
                 anchor_ids=anchor_ids,
                 rel_ids=rel_ids,
-                target_ids=target_ids,
-                conj_flag=conj_flag,
-                num_entities=processor.num_entities,
-                num_neg=args.num_neg,
-                true_head_train=true_head_train,
-                true_tail_train=true_tail_train,
-                device=device,
-                oversample=args.neg_oversample
+                cand_ids=cand_ids,
+                dir_ids=conj_flag.long(),
+                rotate_model=rotate_model,
+                nbr_ent=processor.nbr_ent,
+                nbr_rel=processor.nbr_rel,
+                nbr_dir=processor.nbr_dir,
+                nbr_mask=processor.nbr_mask,
+                freq=processor.freq,
             )
 
-            s_pos = rotate_model.score_from_head_emb(
-                anchor_ref, rel_ids, target_ids.unsqueeze(1), conj=conj_flag
-            ).squeeze(1)
-            s_neg = rotate_model.score_from_head_emb(anchor_ref, rel_ids, neg_ids, conj=conj_flag)
+            if args.train_gamma != 1.0:
+                delta_ref = delta_ref * float(args.train_gamma)
 
-            logits = torch.cat([s_pos.unsqueeze(1), s_neg], dim=1)  # [2B, 1+Neg]
-            labels = torch.zeros(2 * B, dtype=torch.long, device=device)
+            s_pos = s_pos_base + delta_ref[:, 0]
+            s_neg = s_neg_base + delta_ref[:, 1:]
 
-            loss = ce_loss(logits, labels)
+            viol = (s_neg_base > s_pos_base.unsqueeze(1))
+            nonviol = ~viol
+
+            tau = float(args.viol_tau)
+            fix_loss = torch.nn.functional.softplus((s_neg - s_pos.unsqueeze(1)) / max(tau, 1e-6))
+            if viol.any():
+                L_fix = fix_loss[viol].mean()
+            else:
+                L_fix = s_pos.sum() * 0.0
+
+            L_safe = torch.relu(s_neg - s_pos.unsqueeze(1))
+            if nonviol.any():
+                L_safe = L_safe[nonviol].mean()
+            else:
+                L_safe = s_pos.sum() * 0.0
+
+            L_l2 = (delta_ref[:, 1:] ** 2).mean()
+
+            loss = L_fix + float(args.lambda_safe) * L_safe + float(args.lambda_l2) * L_l2
+
+            # pairwise violator loss (aligned with filtered rank)
+            if args.pair_lambda and args.pair_lambda > 0:
+                viol_w = (s_neg_base > s_pos_base.unsqueeze(1)).float()
+                diff = s_neg - s_pos.unsqueeze(1)
+                loss_pair = (viol_w * torch.nn.functional.softplus(diff)).sum() / (viol_w.sum() + 1e-6)
+                loss = loss + args.pair_lambda * loss_pair
+
+            # Anchor drift regularization (head stronger, tail weaker)
+            if args.anchor_reg_lambda and args.anchor_reg_lambda > 0:
+                anchor_ref = refiner.refine_anchor(
+                    anchor_ids, rotate_model,
+                    processor.nbr_ent, processor.nbr_rel, processor.nbr_dir, processor.nbr_mask, processor.freq,
+                    eta_floor=args.eta_floor
+                )
+                with torch.no_grad():
+                    f = processor.freq[anchor_ids].to(device)
+                    logf = torch.log1p(f)
+                    w = (logf - logf.min()) / (logf.max() - logf.min() + 1e-6)
+                reg = ((anchor_ref - base_emb) ** 2).sum(dim=1)
+                loss = loss + args.anchor_reg_lambda * (w * reg).mean()
 
             # ⭐ Gate regularization: keep (w,b) near init to prevent gate collapse
             if args.gate_reg_lambda and args.gate_reg_lambda > 0:
@@ -416,10 +591,35 @@ def main():
             optimizer.step()
 
             total_loss += loss.item()
+            with torch.no_grad():
+                max_neg = s_neg.max(dim=1).values
+                p_pos_gt_maxneg += float((s_pos > max_neg).float().mean().item())
+                margin_sum += float((s_pos - max_neg).mean().item())
+
+                # delta variance + flip diagnostics (topK aligned)
+                delta_std_sum += float(delta_ref[:, 1:].std(dim=1).mean().item())
+                before = (s_neg_base > s_pos_base.unsqueeze(1))
+                after = (s_neg > s_pos.unsqueeze(1))
+                flip = ((before != after) & before).float().mean().item()
+                flip_sum += float(flip)
+                viol_rate_sum += float(before.any(dim=1).float().mean().item())
+                fix = (before & (~after)).float().sum().item()
+                brk = ((~before) & after).float().sum().item()
+                fix_rate_sum += float(fix / (before.float().sum().item() + 1e-6))
+                break_rate_sum += float(brk / ((~before).float().sum().item() + 1e-6))
             n_steps += 1
 
         avg_loss = total_loss / max(n_steps, 1)
-        print(f"Epoch {epoch} | AvgLoss: {avg_loss:.6f}")
+        p_pos = p_pos_gt_maxneg / max(n_steps, 1)
+        margin = margin_sum / max(n_steps, 1)
+        delta_std = delta_std_sum / max(n_steps, 1)
+        flip_rate = flip_sum / max(n_steps, 1)
+        viol_rate = viol_rate_sum / max(n_steps, 1)
+        fix_rate = fix_rate_sum / max(n_steps, 1)
+        break_rate = break_rate_sum / max(n_steps, 1)
+        print(f"Epoch {epoch} | AvgLoss: {avg_loss:.6f} | p(pos>maxneg)={p_pos:.4f} | margin={margin:.4f}")
+        print(f"[Diag] delta_std={delta_std:.4f} | flip_rate={flip_rate:.4f} | viol_rate={viol_rate:.4f} | "
+              f"fix_rate={fix_rate:.4f} | break_rate={break_rate:.4f}")
 
         # 诊断：打印 eta / w / b / g 分布
         if args.diag_every and (epoch % args.diag_every == 0):
