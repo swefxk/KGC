@@ -1,6 +1,7 @@
 import argparse
 import torch
 import os
+from datetime import datetime
 import sys
 import bisect
 from torch.utils.data import DataLoader
@@ -14,6 +15,7 @@ from models.text_encoder import TextEncoder
 from models.semantic_residual import SemanticResidualScorerV2
 from models.semantic_biencoder import SemanticBiEncoderScorer
 from models.struct_refiner import StructRefiner
+from tools.run_meta import write_run_metadata
 
 
 # =========================================================
@@ -590,6 +592,7 @@ def main():
     parser.add_argument("--refiner_topk", type=int, default=500)
 
     parser.add_argument("--eval_split", type=str, default="test", choices=["valid", "test"])
+    parser.add_argument("--out_dir", type=str, default=None)
 
     parser.add_argument("--emb_dim", type=int, default=500)
     parser.add_argument("--margin", type=float, default=9.0)
@@ -603,7 +606,11 @@ def main():
     parser.add_argument("--num_workers", type=int, default=4)
 
     args = parser.parse_args()
+    if args.out_dir is None:
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        args.out_dir = os.path.join("artifacts", f"eval_full_{ts}")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    write_run_metadata(args.out_dir, args)
     print(f"=== Bidirectional Evaluation on {device} (split={args.eval_split}) ===")
 
     processor = KGProcessor(args.data_path, max_neighbors=args.K)

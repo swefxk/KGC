@@ -1,4 +1,6 @@
 import argparse
+import os
+from datetime import datetime
 import time
 import os
 import sys
@@ -17,6 +19,7 @@ from models.semantic_biencoder import SemanticBiEncoderScorer
 from models.struct_refiner import StructRefiner
 from models.gate_injector import ConfidenceGate
 from models.gate_injector import gate_features_from_top_scores
+from tools.run_meta import write_run_metadata
 
 
 def get_relation_buckets(processor, device):
@@ -893,6 +896,7 @@ def main():
     ap.add_argument("--rel_gamma_tail", type=float, default=1.0)
     ap.add_argument("--save_ranks_path", type=str, default=None,
                     help="optional path to save per-query RHS/LHS ranks for paired bootstrap")
+    ap.add_argument("--out_dir", type=str, default=None)
     ap.add_argument("--topk", type=int, default=500)
     ap.add_argument("--chunk_size", type=int, default=2048)
     ap.add_argument("--batch_size", type=int, default=16)
@@ -901,8 +905,12 @@ def main():
     ap.add_argument("--bootstrap_ci", type=float, default=0.95)
     ap.add_argument("--bootstrap_seed", type=int, default=0)
     args = ap.parse_args()
+    if args.out_dir is None:
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        args.out_dir = os.path.join("artifacts", f"eval_topk_{ts}")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    write_run_metadata(args.out_dir, args)
 
     processor = KGProcessor(args.data_path, max_neighbors=16)
     processor.load_files()

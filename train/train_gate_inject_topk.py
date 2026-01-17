@@ -15,6 +15,7 @@ from models.struct_refiner import StructRefiner
 from models.semantic_biencoder import SemanticBiEncoderScorer
 from models.gate_injector import ConfidenceGate, entropy_from_logits
 from eval.eval_full_entity_filtered import load_embeddings
+from tools.run_meta import write_run_metadata
 
 
 @torch.no_grad()
@@ -139,6 +140,7 @@ def main():
     args = ap.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    write_run_metadata(args.save_dir, args)
     save_args(args, args.save_dir)
 
     processor = KGProcessor(args.data_path, max_neighbors=16)

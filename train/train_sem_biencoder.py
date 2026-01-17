@@ -16,6 +16,7 @@ sys.path.append(os.getcwd())
 from data.data_loader import KGProcessor, TrainDataset
 from models.rotate import RotatEModel
 from eval.eval_full_entity_filtered import load_embeddings, build_to_skip, eval_chunked_bidirectional
+from tools.run_meta import write_run_metadata
 from models.semantic_biencoder import SemanticBiEncoderScorer
 
 
@@ -202,6 +203,7 @@ def main():
     set_seed(args.seed)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    write_run_metadata(args.save_dir, args)
     print(f"=== Train Bi-Encoder Sem (SimKGC-style) on {device} ===")
     save_args(args, args.save_dir)
 

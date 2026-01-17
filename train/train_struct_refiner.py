@@ -14,6 +14,7 @@ sys.path.append(os.getcwd())
 from data.data_loader import KGProcessor, TrainDataset
 from models.rotate import RotatEModel
 from models.struct_refiner import StructRefiner
+from tools.run_meta import write_run_metadata
 
 
 def set_seed(seed: int):
@@ -362,6 +363,7 @@ def main():
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     os.makedirs(args.save_dir, exist_ok=True)
+    write_run_metadata(args.save_dir, args)
 
     processor = KGProcessor(args.data_path, max_neighbors=args.K)
     processor.load_files()

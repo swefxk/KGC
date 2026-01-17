@@ -8,6 +8,7 @@ sys.path.append(os.getcwd())
 
 from data.data_loader import KGProcessor
 from models.rotate import RotatEModel
+from tools.run_meta import write_run_metadata
 
 
 @torch.no_grad()
@@ -146,6 +147,9 @@ def main():
     }
     with open(args.out_path + ".json", "w", encoding="utf-8") as f:
         json.dump(meta, f, indent=2, ensure_ascii=False)
+
+    out_dir = os.path.dirname(args.out_path) or "."
+    write_run_metadata(out_dir, args)
 
     print(f"[LHS-CacheV2] Saved: {args.out_path}")
     print(f"[LHS-CacheV2] Meta:  {args.out_path}.json")

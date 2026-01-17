@@ -15,6 +15,7 @@ from models.rotate import RotatEModel
 
 # 复用你已有的严格 filtered bidirectional eval
 from eval.eval_full_entity_filtered import eval_chunked_bidirectional, build_to_skip
+from tools.run_meta import write_run_metadata
 
 
 def set_seed(seed: int):
@@ -305,6 +306,7 @@ def train(args):
 
     best_avg = -1.0
     os.makedirs(args.save_dir, exist_ok=True)
+    write_run_metadata(args.save_dir, args)
     best_path = os.path.join(args.save_dir, "best_model.pth")
 
     # 根据训练模式自动设置 steps_per_epoch
