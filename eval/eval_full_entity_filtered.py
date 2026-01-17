@@ -155,6 +155,7 @@ def eval_chunked_bidirectional(
         refiner_topk=500,
         print_sem_stats=False,
         verbose_every=50,
+        refiner_diag=False,
 ):
     rotate_model.eval()
     if refiner:
@@ -205,6 +206,33 @@ def eval_chunked_bidirectional(
         "rhs": {k: {"mrr": 0.0, "h1": 0, "h10": 0, "n": 0} for k in keys},
         "lhs": {k: {"mrr": 0.0, "h1": 0, "h10": 0, "n": 0} for k in keys},
     }
+
+    ref_diag = None
+    if refiner_diag and refiner is not None:
+        ref_diag = {
+            "anchor_delta": [],
+            "eta": [],
+            "eta_bucket": {0: [], 1: [], 2: []},
+            "p_up_num": 0.0,
+            "p_up_den": 0.0,
+        }
+        ref_diag_max = 50000
+
+        def _append_cap(buf, vals):
+            if len(buf) >= ref_diag_max:
+                return
+            v = vals.detach().float().cpu().flatten()
+            remain = ref_diag_max - len(buf)
+            if v.numel() > remain:
+                v = v[:remain]
+            buf.extend(v.tolist())
+
+        def _eta_for(anchor_ids):
+            f = freq[anchor_ids].to(anchor_ids.device)
+            logf = torch.log1p(f)
+            w = F.softplus(refiner.w_raw)
+            eta = refiner.eta_max * torch.sigmoid(refiner.eta_raw + w * (-logf) + refiner.b)
+            return eta
 
     # --- helpers ---
     def get_anchor_emb(anchor_ids):
@@ -313,6 +341,22 @@ def eval_chunked_bidirectional(
         else:
             anchor_emb = get_anchor_emb(h)
         conj_flag = torch.zeros(B, dtype=torch.bool, device=device)
+
+        if ref_diag is not None:
+            base_emb = rotate_model.entity_embedding[h]
+            ref_emb = refiner.refine_anchor(h, rotate_model, nbr_ent, nbr_rel, nbr_dir, nbr_mask, freq)
+            delta_norm = (ref_emb - base_emb).norm(dim=1)
+            _append_cap(ref_diag["anchor_delta"], delta_norm)
+            eta = _eta_for(h)
+            _append_cap(ref_diag["eta"], eta)
+            for bid in [0, 1, 2]:
+                m = (bucket_map[h] == bid)
+                if m.any():
+                    _append_cap(ref_diag["eta_bucket"][bid], eta[m])
+            s_gold_base = rotate_model.score_from_head_emb(base_emb, r, t.unsqueeze(1), conj=conj_flag).squeeze(1)
+            s_gold_ref = rotate_model.score_from_head_emb(ref_emb, r, t.unsqueeze(1), conj=conj_flag).squeeze(1)
+            ref_diag["p_up_num"] += float((s_gold_ref > s_gold_base).float().sum().item())
+            ref_diag["p_up_den"] += float(B)
 
         # gold
         s_gold_struct = rotate_model.score_from_head_emb(anchor_emb, r, t.unsqueeze(1), conj=conj_flag).squeeze(1)
@@ -426,6 +470,22 @@ def eval_chunked_bidirectional(
         else:
             anchor_emb = get_anchor_emb(t)
         conj_flag = torch.ones(B, dtype=torch.bool, device=device)
+
+        if ref_diag is not None:
+            base_emb = rotate_model.entity_embedding[t]
+            ref_emb = refiner.refine_anchor(t, rotate_model, nbr_ent, nbr_rel, nbr_dir, nbr_mask, freq)
+            delta_norm = (ref_emb - base_emb).norm(dim=1)
+            _append_cap(ref_diag["anchor_delta"], delta_norm)
+            eta = _eta_for(t)
+            _append_cap(ref_diag["eta"], eta)
+            for bid in [0, 1, 2]:
+                m = (bucket_map[t] == bid)
+                if m.any():
+                    _append_cap(ref_diag["eta_bucket"][bid], eta[m])
+            s_gold_base = rotate_model.score_from_head_emb(base_emb, r, h.unsqueeze(1), conj=conj_flag).squeeze(1)
+            s_gold_ref = rotate_model.score_from_head_emb(ref_emb, r, h.unsqueeze(1), conj=conj_flag).squeeze(1)
+            ref_diag["p_up_num"] += float((s_gold_ref > s_gold_base).float().sum().item())
+            ref_diag["p_up_den"] += float(B)
 
         s_gold_struct = rotate_model.score_from_head_emb(anchor_emb, r, h.unsqueeze(1), conj=conj_flag).squeeze(1)
         if refiner_topk_only:
@@ -566,6 +626,32 @@ def eval_chunked_bidirectional(
     print(f"OVERALL    | AVG      | {avg_mrr:.4f}   | {avg_h1:.4f}   | {avg_h10:.4f}   | {n_total * 2:<8}")
     print("=" * 60 + "\n")
 
+    if ref_diag is not None and ref_diag["p_up_den"] > 0:
+        def _q(vals, q):
+            if not vals:
+                return 0.0
+            t = torch.tensor(vals)
+            return float(torch.quantile(t, q).item())
+
+        anchor_vals = ref_diag["anchor_delta"]
+        eta_vals = ref_diag["eta"]
+        anchor_mean = float(torch.tensor(anchor_vals).mean().item()) if anchor_vals else 0.0
+        eta_mean = float(torch.tensor(eta_vals).mean().item()) if eta_vals else 0.0
+        p_up = ref_diag["p_up_num"] / max(ref_diag["p_up_den"], 1e-6)
+        print("[RefinerDiag][Full] anchor_delta_norm: "
+              f"mean={anchor_mean:.6f} p50={_q(anchor_vals, 0.5):.6f} "
+              f"p90={_q(anchor_vals, 0.9):.6f} p99={_q(anchor_vals, 0.99):.6f}")
+        print("[RefinerDiag][Full] eta: "
+              f"mean={eta_mean:.6f} p90={_q(eta_vals, 0.9):.6f} "
+              f"p99={_q(eta_vals, 0.99):.6f}")
+        for bid in [0, 1, 2]:
+            name = bucket_names[bid]
+            vals = ref_diag["eta_bucket"][bid]
+            mean_v = float(torch.tensor(vals).mean().item()) if vals else 0.0
+            print(f"[RefinerDiag][Full] eta_{name}: "
+                  f"mean={mean_v:.6f} p90={_q(vals, 0.9):.6f} p99={_q(vals, 0.99):.6f}")
+        print(f"[RefinerDiag][Full] p_up={p_up:.4f}")
+
     return results
 
 
@@ -590,6 +676,8 @@ def main():
     parser.add_argument("--refiner_topk_only", action="store_true",
                         help="apply refiner only within topK; full-entity rank uses base RotatE")
     parser.add_argument("--refiner_topk", type=int, default=500)
+    parser.add_argument("--refiner_diag", action="store_true",
+                        help="print refiner diagnostics (anchor delta / eta / p_up)")
 
     parser.add_argument("--eval_split", type=str, default="test", choices=["valid", "test"])
     parser.add_argument("--out_dir", type=str, default=None)
@@ -697,6 +785,7 @@ def main():
         refiner_topk_only=args.refiner_topk_only,
         refiner_topk=args.refiner_topk,
         print_sem_stats=args.print_sem_stats,
+        refiner_diag=args.refiner_diag,
     )
 
 

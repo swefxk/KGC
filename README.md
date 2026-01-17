@@ -33,6 +33,16 @@ Eval:
 
 Mainline default reports AVG (RHS+LHS)/2 with RHS/LHS splits, Hits@{1,3,10}, Recall@K, and paired bootstrap ΔMRR CI.
 
+## Evaluation Protocol
+对照组定义：
+- A：结构-only（RotatE 或 Refiner-only，`b=0`, `γ=0`）
+- C：Sem+Gate（`b_rhs/b_lhs + gate`，Δ 关闭）
+- D：Sem+Gate+Δ（在 C 基础上启用 Δ correction，保持 sem-preserving threshold）
+
+评测口径：
+- full-entity filtered rank + topK-only injection/correction
+- 报告 RHS/LHS/AVG + Hits@{1,3,10} + Recall@K + paired ΔMRR CI
+
 ### Requirements
 - Python 3.10+
 - PyTorch (CUDA recommended)
@@ -45,6 +55,11 @@ Mainline default reports AVG (RHS+LHS)/2 with RHS/LHS splits, Hits@{1,3,10}, Rec
 ### One-command run
 ```bash
 bash scripts/run_mainline_full.sh fb15k_custom
+```
+
+### Python One-Click (Optional)
+```bash
+python scripts/run_mainline.py --dataset fb15k_custom
 ```
 
 ### Output artifacts

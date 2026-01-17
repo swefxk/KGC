@@ -142,6 +142,7 @@ def eval_rhs_topk_inject(
     refiner_topm=0,
     collect_ranks=False,
     profile_time=False,
+    refiner_diag=False,
 ):
     rotate_model.eval()
     sem_model.eval()
@@ -159,7 +160,10 @@ def eval_rhs_topk_inject(
     diag = {"delta_rank_sum": 0.0, "p_improve": 0.0, "p_hurt": 0.0,
             "fix_num": 0.0, "fix_den": 0.0, "break_num": 0.0, "break_den": 0.0,
             "delta_gold_sum": 0.0, "gate_on_sum": 0.0, "gate_on_den": 0.0,
-            "rec_num": 0.0, "rec_den": 0.0, "n": 0}
+            "rec_num": 0.0, "rec_den": 0.0, "n": 0,
+            "flip_num": 0.0, "flip_den": 0.0,
+            "p_up_num": 0.0, "p_up_den": 0.0,
+            "p_pair_sum": 0.0, "p_pair_den": 0.0}
     ranks_all = [] if collect_ranks else None
     time_stats = {"struct_topk": 0.0, "sem": 0.0, "refiner": 0.0, "pass2": 0.0} if profile_time else None
     time_stats = {"struct_topk": 0.0, "sem": 0.0, "refiner": 0.0, "pass2": 0.0} if profile_time else None
@@ -303,6 +307,40 @@ def eval_rhs_topk_inject(
         else:
             delta_ref_topk = 0.0
             delta_ref_gold = 0.0
+
+        if refiner_diag and use_refiner_rerank and torch.is_tensor(delta_ref_topk):
+            if torch.is_tensor(delta_ref_gold):
+                diag["p_up_num"] += float((delta_ref_gold > 0).float().sum().item())
+                diag["p_up_den"] += float(B)
+                s_gold_ref = s_gold_struct + delta_ref_gold
+            else:
+                s_gold_ref = s_gold_struct
+            s_neg_ref = top_scores + delta_ref_topk
+            s_neg_struct = top_scores
+            margin_ref = s_gold_ref.unsqueeze(1) - s_neg_ref
+            margin_base = s_gold_struct.unsqueeze(1) - s_neg_struct
+            diag["p_pair_sum"] += float((margin_ref > margin_base).float().mean(dim=1).sum().item())
+            diag["p_pair_den"] += float(B)
+            new_idx = (s_neg_ref).argmax(dim=1)
+            diag["flip_num"] += float((new_idx != 0).float().sum().item())
+            diag["flip_den"] += float(B)
+
+        if refiner_diag and use_refiner_rerank and torch.is_tensor(delta_ref_topk):
+            if torch.is_tensor(delta_ref_gold):
+                diag["p_up_num"] += float((delta_ref_gold > 0).float().sum().item())
+                diag["p_up_den"] += float(B)
+                s_gold_ref = s_gold_struct + delta_ref_gold
+            else:
+                s_gold_ref = s_gold_struct
+            s_neg_ref = top_scores + delta_ref_topk
+            s_neg_struct = top_scores
+            margin_ref = s_gold_ref.unsqueeze(1) - s_neg_ref
+            margin_base = s_gold_struct.unsqueeze(1) - s_neg_struct
+            diag["p_pair_sum"] += float((margin_ref > margin_base).float().mean(dim=1).sum().item())
+            diag["p_pair_den"] += float(B)
+            new_idx = (s_neg_ref).argmax(dim=1)
+            diag["flip_num"] += float((new_idx != 0).float().sum().item())
+            diag["flip_den"] += float(B)
 
         # optional masks for candidate-aware delta
         if use_refiner_rerank and refiner_viol_only:
@@ -487,6 +525,10 @@ def eval_rhs_topk_inject(
         print(f"[Recall@K][RHS] recall@{topk}={diag['rec_num'] / max(diag['rec_den'], 1e-6):.4f}")
     if diag["gate_on_den"] > 0:
         print(f"[DeltaGate][RHS] on_rate={diag['gate_on_sum'] / max(diag['gate_on_den'], 1e-6):.4f}")
+    if refiner_diag and diag["flip_den"] > 0:
+        print(f"[RefinerDiag][RHS] flip@K={diag['flip_num'] / max(diag['flip_den'], 1e-6):.4f} "
+              f"p_up={diag['p_up_num'] / max(diag['p_up_den'], 1e-6):.4f} "
+              f"p_pair={diag['p_pair_sum'] / max(diag['p_pair_den'], 1e-6):.4f}")
     return stats, None, diag
 
 
@@ -524,6 +566,7 @@ def eval_lhs_topk_inject(
     refiner_topm=0,
     collect_ranks=False,
     profile_time=False,
+    refiner_diag=False,
 ):
     rotate_model.eval()
     sem_model.eval()
@@ -826,6 +869,10 @@ def eval_lhs_topk_inject(
         print(f"[Recall@K][LHS] recall@{topk}={diag['rec_num'] / max(diag['rec_den'], 1e-6):.4f}")
     if diag["gate_on_den"] > 0:
         print(f"[DeltaGate][LHS] on_rate={diag['gate_on_sum'] / max(diag['gate_on_den'], 1e-6):.4f}")
+    if refiner_diag and diag["flip_den"] > 0:
+        print(f"[RefinerDiag][LHS] flip@K={diag['flip_num'] / max(diag['flip_den'], 1e-6):.4f} "
+              f"p_up={diag['p_up_num'] / max(diag['p_up_den'], 1e-6):.4f} "
+              f"p_pair={diag['p_pair_sum'] / max(diag['p_pair_den'], 1e-6):.4f}")
     return stats, None, diag
 
 
@@ -888,6 +935,8 @@ def main():
                     help="gate delta by entropy quantile q (e.g., 0.8 keeps top 20%)")
     ap.add_argument("--profile_time", action="store_true",
                     help="profile time breakdown and sem ratio")
+    ap.add_argument("--refiner_diag", action="store_true",
+                    help="print refiner diagnostics (flip@K / p_up / p_pair)")
     ap.add_argument("--rel_gamma_mode", type=str, default="none",
                     choices=["none", "bucket"],
                     help="apply relation-wise gamma (bucketed by frequency)")
@@ -1061,6 +1110,7 @@ def main():
             refiner_viol_only=args.refiner_viol_only,
             refiner_topm=args.refiner_topm,
             profile_time=args.profile_time,
+            refiner_diag=args.refiner_diag,
         )
 
     if args.eval_sides in ["lhs", "both"]:
@@ -1097,6 +1147,7 @@ def main():
             refiner_viol_only=args.refiner_viol_only,
             refiner_topm=args.refiner_topm,
             profile_time=args.profile_time,
+            refiner_diag=args.refiner_diag,
         )
 
     if args.eval_sides == "both" and rhs_stats and lhs_stats:
