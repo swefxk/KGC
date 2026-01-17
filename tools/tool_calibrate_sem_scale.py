@@ -11,7 +11,7 @@ sys.path.append(os.getcwd())
 
 from data.data_loader import KGProcessor, TrainDataset
 from models.rotate import RotatEModel
-from test_semres import load_embeddings, build_to_skip
+from eval.eval_full_entity_filtered import load_embeddings, build_to_skip
 from models.semantic_biencoder import SemanticBiEncoderScorer
 
 

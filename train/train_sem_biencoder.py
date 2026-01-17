@@ -15,7 +15,7 @@ sys.path.append(os.getcwd())
 
 from data.data_loader import KGProcessor, TrainDataset
 from models.rotate import RotatEModel
-from test_semres import load_embeddings, build_to_skip, eval_chunked_bidirectional
+from eval.eval_full_entity_filtered import load_embeddings, build_to_skip, eval_chunked_bidirectional
 from models.semantic_biencoder import SemanticBiEncoderScorer
 
 
@@ -366,7 +366,7 @@ def main():
                 # ---- false-negative mask (train true tails) ----
                 forb = forb_mask = None
                 if true_tails is not None:
-                forb, forb_mask = make_forbidden_padded(h, r, true_tails, device=device, max_forb=args.max_forb)
+                    forb, forb_mask = make_forbidden_padded(h, r, true_tails, device=device, max_forb=args.max_forb)
                 if forb is not None:
                     # mask hard
                     # [B,Kh,M]

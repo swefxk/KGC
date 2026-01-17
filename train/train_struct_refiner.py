@@ -56,7 +56,7 @@ def build_true_head_tail_from_train(train_triplets: torch.LongTensor):
     """
     只用 train 构建真值集合（防泄漏）：
     true_tail[(h,r)] = {t}
-    true_head[(t,r)] = {h}   # key 约定与 test_semres 的 lhs 一致：(t,r)->{h}
+    true_head[(t,r)] = {h}   # key 约定与 eval_full_entity_filtered 的 lhs 一致：(t,r)->{h}
     """
     true_tail = {}
     true_head = {}
@@ -493,16 +493,15 @@ def main():
                 neg_ids = rhs_neg
                 conj_flag = torch.zeros(B, dtype=torch.bool, device=device)
             else:
-            # 2B 混合：RHS + LHS
-            anchor_ids = torch.cat([h, t], dim=0)  # [2B]
-            rel_ids = torch.cat([r, r], dim=0)     # [2B]
-            target_ids = torch.cat([t, h], dim=0)  # [2B]
+                # 2B 混合：RHS + LHS
+                anchor_ids = torch.cat([h, t], dim=0)  # [2B]
+                rel_ids = torch.cat([r, r], dim=0)     # [2B]
+                target_ids = torch.cat([t, h], dim=0)  # [2B]
                 neg_ids = torch.cat([rhs_neg, lhs_neg], dim=0)  # [2B, Neg]
-            conj_flag = torch.cat([
-                torch.zeros(B, dtype=torch.bool, device=device),  # RHS
-                torch.ones(B, dtype=torch.bool, device=device)    # LHS
-            ], dim=0)
-
+                conj_flag = torch.cat([
+                    torch.zeros(B, dtype=torch.bool, device=device),  # RHS
+                    torch.ones(B, dtype=torch.bool, device=device)    # LHS
+                ], dim=0)
             # base structural scores (RotatE)
             base_emb = rotate_model.entity_embedding[anchor_ids]
             s_neg_base = rotate_model.score_from_head_emb(base_emb, rel_ids, neg_ids, conj=conj_flag)

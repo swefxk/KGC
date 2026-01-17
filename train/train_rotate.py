@@ -14,7 +14,7 @@ from data.data_loader import KGProcessor, TrainDataset
 from models.rotate import RotatEModel
 
 # 复用你已有的严格 filtered bidirectional eval
-from test_semres import eval_chunked_bidirectional, build_to_skip
+from eval.eval_full_entity_filtered import eval_chunked_bidirectional, build_to_skip
 
 
 def set_seed(seed: int):
@@ -174,7 +174,7 @@ class BidirectionalOneShotIterator:
 @torch.no_grad()
 def sanity_check_scores(model: RotatEModel, triples: torch.Tensor, device: torch.device, tol: float = 1e-4):
     """
-    自检：训练用 score 与 test_semres.py 用 score_from_head_emb 数学一致。
+    自检：训练用 score 与 eval/eval_full_entity_filtered.py 用 score_from_head_emb 数学一致。
     不一致就别训了，指标没有意义。
     """
     model.eval()
@@ -203,7 +203,7 @@ def sanity_check_scores(model: RotatEModel, triples: torch.Tensor, device: torch
 
     if e1 > tol or e2 > tol:
         raise RuntimeError(
-            "评分函数不一致：你训练用的 score 和 test_semres.py 用的 score_from_head_emb 不一致。\n"
+            "评分函数不一致：你训练用的 score 和 eval/eval_full_entity_filtered.py 用的 score_from_head_emb 不一致。\n"
             "先修 RotatEModel：保证 forward(single) 与 score_from_head_emb 完全一致。"
         )
 
@@ -409,7 +409,7 @@ def train(args):
               f"tail-batch: {mode_counter['tail-batch']} ({tail_ratio:.1f}%)")
 
         if args.eval_every and (epoch % args.eval_every == 0):
-            print(f"Evaluating on {args.eval_split} (filtered, bidirectional) using test_semres.py evaluator...")
+            print(f"Evaluating on {args.eval_split} (filtered, bidirectional) using eval/eval_full_entity_filtered.py evaluator...")
             metrics = eval_chunked_bidirectional(
                 processor=processor,
                 rotate_model=model,

@@ -17,7 +17,7 @@ from data.data_loader import KGProcessor, TrainDataset
 from models.rotate import RotatEModel
 from models.semantic_residual import SemanticResidualScorerV2
 
-from test_semres import eval_chunked_bidirectional, load_embeddings, build_to_skip
+from eval.eval_full_entity_filtered import eval_chunked_bidirectional, load_embeddings, build_to_skip
 
 
 # -------------------------

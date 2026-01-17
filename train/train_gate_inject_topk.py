@@ -14,7 +14,7 @@ from models.rotate import RotatEModel
 from models.struct_refiner import StructRefiner
 from models.semantic_biencoder import SemanticBiEncoderScorer
 from models.gate_injector import ConfidenceGate, entropy_from_logits
-from test_semres import load_embeddings
+from eval.eval_full_entity_filtered import load_embeddings
 
 
 @torch.no_grad()
@@ -163,12 +163,12 @@ def main():
     refiner = None
     nbr_ent = nbr_rel = nbr_dir = nbr_mask = freq = None
     if args.pretrained_refiner:
-            refiner = StructRefiner(
-                emb_dim=500,
-                K=16,
-                num_relations=processor.num_relations,
-            ).to(device)
-            refiner.load_state_dict(torch.load(args.pretrained_refiner, map_location=device), strict=False)
+        refiner = StructRefiner(
+            emb_dim=500,
+            K=16,
+            num_relations=processor.num_relations,
+        ).to(device)
+        refiner.load_state_dict(torch.load(args.pretrained_refiner, map_location=device), strict=False)
         refiner.eval()
         for p in refiner.parameters():
             p.requires_grad = False

@@ -10,7 +10,7 @@ sys.path.append(os.getcwd())
 
 from data.data_loader import KGProcessor, TrainDataset
 from models.rotate import RotatEModel
-from test_semres import build_to_skip, load_embeddings, get_freq_buckets
+from eval.eval_full_entity_filtered import build_to_skip, load_embeddings, get_freq_buckets
 
 # biencoder
 from models.semantic_biencoder import SemanticBiEncoderScorer
