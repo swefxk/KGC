@@ -42,6 +42,7 @@ Mainline default reports AVG (RHS+LHS)/2 with RHS/LHS splits, Hits@{1,3,10}, Rec
 评测口径：
 - full-entity filtered rank + topK-only injection/correction
 - 报告 RHS/LHS/AVG + Hits@{1,3,10} + Recall@K + paired ΔMRR CI
+- paired bootstrap over queries for ΔMRR (D−C)
 
 ### Requirements
 - Python 3.10+
