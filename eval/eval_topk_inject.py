@@ -957,6 +957,12 @@ def main():
     ap.add_argument("--rel_gamma_tail", type=float, default=1.0)
     ap.add_argument("--save_ranks_path", type=str, default=None,
                     help="optional path to save per-query RHS/LHS ranks for paired bootstrap")
+    ap.add_argument("--paired_bootstrap", action="store_true",
+                    help="compute paired bootstrap ΔMRR using baseline ranks")
+    ap.add_argument("--paired_baseline_ranks", type=str, default=None,
+                    help="path to baseline ranks .pt (from --save_ranks_path)")
+    ap.add_argument("--paired_baseline_out_dir", type=str, default=None,
+                    help="baseline out_dir that contains ranks.pt (from --save_ranks_path)")
     ap.add_argument("--out_dir", type=str, default=None)
     ap.add_argument("--topk", type=int, default=500)
     ap.add_argument("--chunk_size", type=int, default=2048)
@@ -1088,6 +1094,10 @@ def main():
     b_rhs = float(args.b_scale) if args.b_rhs is None else float(args.b_rhs)
     b_lhs = float(args.b_scale) if args.b_lhs is None else float(args.b_lhs)
 
+    collect_ranks = (args.bootstrap_samples > 0) or args.paired_bootstrap or (args.save_ranks_path is not None)
+    if args.paired_bootstrap and args.bootstrap_samples <= 0:
+        raise ValueError("--paired_bootstrap requires --bootstrap_samples > 0")
+
     if args.eval_sides in ["rhs", "both"]:
         rhs_stats, rhs_ranks, rhs_diag = eval_rhs_topk_inject(
             processor=processor,
@@ -1111,7 +1121,7 @@ def main():
             chunk_size=args.chunk_size,
             b_scale=b_rhs,
             get_b_fn=get_b_fn,
-            collect_ranks=args.bootstrap_samples > 0,
+            collect_ranks=collect_ranks,
             refiner_gamma=args.refiner_gamma_rhs,
             gamma_by_rel=gamma_by_rel,
             gold_struct_threshold=args.gold_struct_threshold,
@@ -1148,7 +1158,7 @@ def main():
             chunk_size=args.chunk_size,
             b_scale=b_lhs,
             get_b_fn=get_b_fn,
-            collect_ranks=args.bootstrap_samples > 0,
+            collect_ranks=collect_ranks,
             refiner_gamma=args.refiner_gamma_lhs,
             gamma_by_rel=gamma_by_rel,
             gold_struct_threshold=args.gold_struct_threshold,
@@ -1245,6 +1255,65 @@ def main():
     if args.save_ranks_path and args.eval_sides == "both" and rhs_ranks is not None and lhs_ranks is not None:
         torch.save({"rhs_ranks": rhs_ranks.cpu(), "lhs_ranks": lhs_ranks.cpu()}, args.save_ranks_path)
         print(f"[Ranks] saved to {args.save_ranks_path}")
+
+    # paired bootstrap (ΔMRR)
+    if args.paired_bootstrap and args.eval_sides == "both":
+        base_path = args.paired_baseline_ranks
+        if base_path is None and args.paired_baseline_out_dir is not None:
+            base_path = os.path.join(args.paired_baseline_out_dir, "ranks.pt")
+        if base_path is None:
+            raise ValueError("paired bootstrap requires --paired_baseline_ranks or --paired_baseline_out_dir")
+        base_obj = torch.load(base_path, map_location="cpu")
+        base_rhs = base_obj["rhs_ranks"].float()
+        base_lhs = base_obj["lhs_ranks"].float()
+        if rhs_ranks is None or lhs_ranks is None:
+            raise ValueError("paired bootstrap requires current run ranks; set --save_ranks_path or use --bootstrap_samples > 0")
+        rhs_r = rhs_ranks.float().cpu()
+        lhs_r = lhs_ranks.float().cpu()
+        if base_rhs.numel() != rhs_r.numel() or base_lhs.numel() != lhs_r.numel():
+            raise ValueError("paired baseline ranks size mismatch")
+
+        n = rhs_r.numel()
+        torch.manual_seed(args.bootstrap_seed)
+        alpha = (1.0 - float(args.bootstrap_ci)) / 2.0
+
+        # AVG ΔMRR
+        base_avg = 0.5 * ((1.0 / base_rhs) + (1.0 / base_lhs))
+        cur_avg = 0.5 * ((1.0 / rhs_r) + (1.0 / lhs_r))
+        delta_avg = cur_avg - base_avg
+        samples = []
+        for _ in range(args.bootstrap_samples):
+            idx = torch.randint(0, n, (n,))
+            samples.append(delta_avg[idx].mean().item())
+        samples = torch.tensor(samples)
+        lo = torch.quantile(samples, alpha).item()
+        hi = torch.quantile(samples, 1.0 - alpha).item()
+        print(f"[PairedBootstrap][AVG] ΔMRR={delta_avg.mean().item():.4f} "
+              f"CI{int(args.bootstrap_ci*100)}%=[{lo:.4f}, {hi:.4f}] samples={args.bootstrap_samples}")
+
+        # RHS ΔMRR
+        delta_rhs = (1.0 / rhs_r) - (1.0 / base_rhs)
+        samples = []
+        for _ in range(args.bootstrap_samples):
+            idx = torch.randint(0, n, (n,))
+            samples.append(delta_rhs[idx].mean().item())
+        samples = torch.tensor(samples)
+        lo = torch.quantile(samples, alpha).item()
+        hi = torch.quantile(samples, 1.0 - alpha).item()
+        print(f"[PairedBootstrap][RHS] ΔMRR={delta_rhs.mean().item():.4f} "
+              f"CI{int(args.bootstrap_ci*100)}%=[{lo:.4f}, {hi:.4f}] samples={args.bootstrap_samples}")
+
+        # LHS ΔMRR
+        delta_lhs = (1.0 / lhs_r) - (1.0 / base_lhs)
+        samples = []
+        for _ in range(args.bootstrap_samples):
+            idx = torch.randint(0, n, (n,))
+            samples.append(delta_lhs[idx].mean().item())
+        samples = torch.tensor(samples)
+        lo = torch.quantile(samples, alpha).item()
+        hi = torch.quantile(samples, 1.0 - alpha).item()
+        print(f"[PairedBootstrap][LHS] ΔMRR={delta_lhs.mean().item():.4f} "
+              f"CI{int(args.bootstrap_ci*100)}%=[{lo:.4f}, {hi:.4f}] samples={args.bootstrap_samples}")
 
 if __name__ == "__main__":
     main()
