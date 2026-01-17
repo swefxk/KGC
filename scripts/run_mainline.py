@@ -20,7 +20,9 @@ def run(cmd, env=None):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dataset", type=str, default="fb15k_custom")
-    ap.add_argument("--run_root", type=str, default="runs")
+    ap.add_argument("--run_root", type=str, default="artifacts")
+    ap.add_argument("--run_id", type=str, default=None,
+                    help="固定本次产物目录名；不指定则使用时间戳")
     ap.add_argument("--epochs_sem", type=int, default=10)
     ap.add_argument("--epochs_refiner", type=int, default=5)
     ap.add_argument("--epochs_gate", type=int, default=5)
@@ -32,12 +34,13 @@ def main():
     args = ap.parse_args()
 
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_dir = os.path.join(args.run_root, ts)
+    run_id = args.run_id or ts
+    run_dir = os.path.join(args.run_root, run_id)
     os.makedirs(run_dir, exist_ok=True)
     write_run_metadata(run_dir, args)
 
     data_path = os.path.join("data", args.dataset)
-    ckpt_root = os.path.join("checkpoints", f"mainline_{args.dataset}")
+    ckpt_root = os.path.join(run_dir, "checkpoints")
     rotate_dir = os.path.join(ckpt_root, "rotate")
     sem_dir = os.path.join(ckpt_root, "sem_biencoder")
     gate_dir = os.path.join(ckpt_root, "gate")
@@ -47,7 +50,7 @@ def main():
     os.makedirs(gate_dir, exist_ok=True)
     os.makedirs(refiner_dir, exist_ok=True)
 
-    cache_dir = os.path.join(data_path, "cache")
+    cache_dir = os.path.join(run_dir, "cache")
     os.makedirs(cache_dir, exist_ok=True)
     rhs_cache = os.path.join(cache_dir, "train_rhs_top500_neg_filtered_trainvalid.pt")
     lhs_cache = os.path.join(cache_dir, "train_lhs_top500_neg_filtered_trainvalid.pt")
