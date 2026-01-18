@@ -1,4 +1,5 @@
 import argparse
+import json
 import torch
 import os
 from datetime import datetime
@@ -156,6 +157,7 @@ def eval_chunked_bidirectional(
         print_sem_stats=False,
         verbose_every=50,
         refiner_diag=False,
+        recall_k=200,
 ):
     rotate_model.eval()
     if refiner:
@@ -203,8 +205,8 @@ def eval_chunked_bidirectional(
 
     keys = ["total", 0, 1, 2]
     stats = {
-        "rhs": {k: {"mrr": 0.0, "h1": 0, "h10": 0, "n": 0} for k in keys},
-        "lhs": {k: {"mrr": 0.0, "h1": 0, "h10": 0, "n": 0} for k in keys},
+        "rhs": {k: {"mrr": 0.0, "h1": 0, "h3": 0, "h10": 0, "rec": 0, "n": 0} for k in keys},
+        "lhs": {k: {"mrr": 0.0, "h1": 0, "h3": 0, "h10": 0, "rec": 0, "n": 0} for k in keys},
     }
 
     ref_diag = None
@@ -308,11 +310,15 @@ def eval_chunked_bidirectional(
     def update_stats(side, rank, target_ids):
         mrr_val = (1.0 / rank.float())
         h1_val = (rank <= 1)
+        h3_val = (rank <= 3)
         h10_val = (rank <= 10)
+        rec_val = (rank <= recall_k)
 
         stats[side]["total"]["mrr"] += mrr_val.sum().item()
         stats[side]["total"]["h1"] += h1_val.sum().item()
+        stats[side]["total"]["h3"] += h3_val.sum().item()
         stats[side]["total"]["h10"] += h10_val.sum().item()
+        stats[side]["total"]["rec"] += rec_val.sum().item()
         stats[side]["total"]["n"] += int(target_ids.numel())
 
         buckets = bucket_map[target_ids]
@@ -321,7 +327,9 @@ def eval_chunked_bidirectional(
             if mask.any():
                 stats[side][bid]["mrr"] += mrr_val[mask].sum().item()
                 stats[side][bid]["h1"] += h1_val[mask].sum().item()
+                stats[side][bid]["h3"] += h3_val[mask].sum().item()
                 stats[side][bid]["h10"] += h10_val[mask].sum().item()
+                stats[side][bid]["rec"] += rec_val[mask].sum().item()
                 stats[side][bid]["n"] += int(mask.sum().item())
 
     print(f"Start Bidirectional Evaluation (split={eval_split}, Chunk={chunk_size}, SemSubChunk={sem_subchunk}, Bisect Optimized)...")
@@ -585,7 +593,7 @@ def eval_chunked_bidirectional(
 
     # --- Reporting ---
     print("\n" + "=" * 60)
-    print(f"{'Metric':<10} | {'Set':<8} | {'MRR':<8} | {'H@1':<8} | {'H@10':<8} | {'Count':<8}")
+    print(f"{'Metric':<10} | {'Set':<8} | {'MRR':<8} | {'H@1':<8} | {'H@3':<8} | {'H@10':<8} | {'Rec@K':<8} | {'Count':<8}")
     print("-" * 60)
 
     results = {"rhs": {}, "lhs": {}, "avg": {}}
@@ -595,7 +603,9 @@ def eval_chunked_bidirectional(
         results[side]["total"] = {
             "MRR": stats[side]["total"]["mrr"] / n_total,
             "H1": stats[side]["total"]["h1"] / n_total,
-            "H10": stats[side]["total"]["h10"] / n_total
+            "H3": stats[side]["total"]["h3"] / n_total,
+            "H10": stats[side]["total"]["h10"] / n_total,
+            "RecK": stats[side]["total"]["rec"] / n_total,
         }
 
         for bid in [0, 1, 2]:
@@ -604,26 +614,32 @@ def eval_chunked_bidirectional(
             results[side][bname] = {
                 "MRR": stats[side][bid]["mrr"] / n_b,
                 "H1": stats[side][bid]["h1"] / n_b,
-                "H10": stats[side][bid]["h10"] / n_b
+                "H3": stats[side][bid]["h3"] / n_b,
+                "H10": stats[side][bid]["h10"] / n_b,
+                "RecK": stats[side][bid]["rec"] / n_b,
             }
 
             row_name = f"{side.upper()} {bname}"
             print(
                 f"{row_name:<10} | {bname:<8} | {results[side][bname]['MRR']:.4f}   | "
-                f"{results[side][bname]['H1']:.4f}   | {results[side][bname]['H10']:.4f}   | {n_b:<8}"
+                f"{results[side][bname]['H1']:.4f}   | {results[side][bname]['H3']:.4f}   | "
+                f"{results[side][bname]['H10']:.4f}   | {results[side][bname]['RecK']:.4f}   | {n_b:<8}"
             )
 
         print(
             f"{side.upper()} TOTAL | ALL      | {results[side]['total']['MRR']:.4f}   | "
-            f"{results[side]['total']['H1']:.4f}   | {results[side]['total']['H10']:.4f}   | {n_total:<8}"
+            f"{results[side]['total']['H1']:.4f}   | {results[side]['total']['H3']:.4f}   | "
+            f"{results[side]['total']['H10']:.4f}   | {results[side]['total']['RecK']:.4f}   | {n_total:<8}"
         )
         print("-" * 60)
 
     avg_mrr = (results["rhs"]["total"]["MRR"] + results["lhs"]["total"]["MRR"]) / 2
     avg_h1 = (results["rhs"]["total"]["H1"] + results["lhs"]["total"]["H1"]) / 2
+    avg_h3 = (results["rhs"]["total"]["H3"] + results["lhs"]["total"]["H3"]) / 2
     avg_h10 = (results["rhs"]["total"]["H10"] + results["lhs"]["total"]["H10"]) / 2
+    avg_rec = (results["rhs"]["total"]["RecK"] + results["lhs"]["total"]["RecK"]) / 2
 
-    print(f"OVERALL    | AVG      | {avg_mrr:.4f}   | {avg_h1:.4f}   | {avg_h10:.4f}   | {n_total * 2:<8}")
+    print(f"OVERALL    | AVG      | {avg_mrr:.4f}   | {avg_h1:.4f}   | {avg_h3:.4f}   | {avg_h10:.4f}   | {avg_rec:.4f}   | {n_total * 2:<8}")
     print("=" * 60 + "\n")
 
     if ref_diag is not None and ref_diag["p_up_den"] > 0:
@@ -681,6 +697,7 @@ def main():
 
     parser.add_argument("--eval_split", type=str, default="test", choices=["valid", "test"])
     parser.add_argument("--out_dir", type=str, default=None)
+    parser.add_argument("--recall_k", type=int, default=200)
 
     parser.add_argument("--emb_dim", type=int, default=500)
     parser.add_argument("--margin", type=float, default=9.0)
@@ -698,6 +715,7 @@ def main():
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         args.out_dir = os.path.join("artifacts", f"eval_full_{ts}")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    os.makedirs(args.out_dir, exist_ok=True)
     write_run_metadata(args.out_dir, args)
     print(f"=== Bidirectional Evaluation on {device} (split={args.eval_split}) ===")
 
@@ -765,7 +783,7 @@ def main():
         pin_memory=True
     )
 
-    _ = eval_chunked_bidirectional(
+    results = eval_chunked_bidirectional(
         processor=processor,
         rotate_model=rotate_model,
         test_loader=test_loader,
@@ -786,7 +804,27 @@ def main():
         refiner_topk=args.refiner_topk,
         print_sem_stats=args.print_sem_stats,
         refiner_diag=args.refiner_diag,
+        recall_k=args.recall_k,
     )
+
+    # save metrics.json
+    metrics = {
+        "split": args.eval_split,
+        "recall_k": args.recall_k,
+        "rhs": results["rhs"],
+        "lhs": results["lhs"],
+        "avg": {
+            "MRR": (results["rhs"]["total"]["MRR"] + results["lhs"]["total"]["MRR"]) / 2,
+            "H1": (results["rhs"]["total"]["H1"] + results["lhs"]["total"]["H1"]) / 2,
+            "H3": (results["rhs"]["total"]["H3"] + results["lhs"]["total"]["H3"]) / 2,
+            "H10": (results["rhs"]["total"]["H10"] + results["lhs"]["total"]["H10"]) / 2,
+            "RecK": (results["rhs"]["total"]["RecK"] + results["lhs"]["total"]["RecK"]) / 2,
+        },
+    }
+    metrics_path = os.path.join(args.out_dir, "metrics.json")
+    with open(metrics_path, "w", encoding="utf-8") as f:
+        json.dump(metrics, f, ensure_ascii=False, indent=2)
+    print(f"[Metrics] saved to {metrics_path}")
 
 
 if __name__ == "__main__":

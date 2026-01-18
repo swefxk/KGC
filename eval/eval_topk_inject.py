@@ -1,4 +1,5 @@
 import argparse
+import json
 import os
 from datetime import datetime
 import time
@@ -891,7 +892,7 @@ def load_sem_model(ckpt_path, text_dim, num_relations, device):
             text_norm=cfg.get("text_norm", True),
         ).to(device)
         try:
-            model.load_state_dict(ckpt["state_dict"], strict=True)
+        model.load_state_dict(ckpt["state_dict"], strict=True)
         except RuntimeError:
             incompatible = model.load_state_dict(ckpt["state_dict"], strict=False)
             missing = set(incompatible.missing_keys)
@@ -977,6 +978,7 @@ def main():
         args.out_dir = os.path.join("artifacts", f"eval_topk_{ts}")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    os.makedirs(args.out_dir, exist_ok=True)
     write_run_metadata(args.out_dir, args)
 
     processor = KGProcessor(args.data_path, max_neighbors=16)
@@ -1206,6 +1208,51 @@ def main():
             print(f"[Diag LHS] mean(delta_rank_topk)={mean_delta_rank:.4f} p_improve={p_improve:.4f} p_hurt={p_hurt:.4f}")
             print(f"[Diag LHS] fix_rate={fix_rate:.4f} break_rate={break_rate:.4f}")
             print(f"[Diag LHS] mean(delta_gold)={mean_delta_gold:.4f}")
+
+    # save metrics.json
+    def _pack_stats(side_stats, side_diag):
+        def safe_div(a, b): return a / max(1, b)
+        out = {}
+        for key in [0, 1, 2, "total"]:
+            name = "total" if key == "total" else {0: "Tail", 1: "Torso", 2: "Head"}[key]
+            n = side_stats[key]["n"]
+            out[name] = {
+                "MRR": safe_div(side_stats[key]["mrr"], n),
+                "H1": safe_div(side_stats[key]["h1"], n),
+                "H3": safe_div(side_stats[key]["h3"], n),
+                "H10": safe_div(side_stats[key]["h10"], n),
+                "n": int(n),
+            }
+        if side_diag and side_diag.get("rec_den", 0) > 0:
+            out["total"]["RecK"] = side_diag["rec_num"] / max(side_diag["rec_den"], 1e-6)
+        else:
+            out["total"]["RecK"] = None
+        return out
+
+    metrics = {
+        "split": args.eval_split,
+        "topk": args.topk,
+        "recall_k": args.topk,
+    }
+    if rhs_stats:
+        metrics["rhs"] = _pack_stats(rhs_stats, rhs_diag)
+    if lhs_stats:
+        metrics["lhs"] = _pack_stats(lhs_stats, lhs_diag)
+    if rhs_stats and lhs_stats:
+        metrics["avg"] = {
+            "MRR": 0.5 * (metrics["rhs"]["total"]["MRR"] + metrics["lhs"]["total"]["MRR"]),
+            "H1": 0.5 * (metrics["rhs"]["total"]["H1"] + metrics["lhs"]["total"]["H1"]),
+            "H3": 0.5 * (metrics["rhs"]["total"]["H3"] + metrics["lhs"]["total"]["H3"]),
+            "H10": 0.5 * (metrics["rhs"]["total"]["H10"] + metrics["lhs"]["total"]["H10"]),
+            "RecK": None,
+        }
+        if metrics["rhs"]["total"]["RecK"] is not None and metrics["lhs"]["total"]["RecK"] is not None:
+            metrics["avg"]["RecK"] = 0.5 * (metrics["rhs"]["total"]["RecK"] + metrics["lhs"]["total"]["RecK"])
+
+    metrics_path = os.path.join(args.out_dir, "metrics.json")
+    with open(metrics_path, "w", encoding="utf-8") as f:
+        json.dump(metrics, f, ensure_ascii=False, indent=2)
+    print(f"[Metrics] saved to {metrics_path}")
 
     if args.bootstrap_samples > 0:
         torch.manual_seed(args.bootstrap_seed)

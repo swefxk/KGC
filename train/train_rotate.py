@@ -427,6 +427,7 @@ def train(args):
                 disable_refiner=True,
                 disable_semres=True,
                 verbose_every=50,
+                recall_k=args.eval_recall_k,
             )
             rhs = metrics["rhs"]["total"]["MRR"]
             lhs = metrics["lhs"]["total"]["MRR"]
@@ -447,12 +448,12 @@ def main():
     p.add_argument("--data_path", type=str, default="data/fb15k_custom")
     p.add_argument("--save_dir", type=str, required=True)
 
-    p.add_argument("--emb_dim", type=int, default=500)
+    p.add_argument("--emb_dim", type=int, default=1000)
     p.add_argument("--margin", type=float, default=9.0)
 
-    p.add_argument("--batch_size", type=int, default=512)
+    p.add_argument("--batch_size", type=int, default=1024)
     p.add_argument("--num_neg", type=int, default=256)
-    p.add_argument("--lr", type=float, default=1e-3)
+    p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--epochs", type=int, default=200)
 
     # official knobs
@@ -470,6 +471,7 @@ def main():
     p.add_argument("--eval_split", type=str, default="valid", choices=["valid", "test"])
     p.add_argument("--eval_batch_size", type=int, default=16)
     p.add_argument("--eval_chunk_size", type=int, default=2048)
+    p.add_argument("--eval_recall_k", type=int, default=200)
 
     # infra
     p.add_argument("--grad_clip", type=float, default=1.0)

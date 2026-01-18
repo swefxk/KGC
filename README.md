@@ -81,3 +81,4 @@ python scripts/run_mainline.py --dataset fb15k_custom
 - `gamma_rhs=2.0`
 - `gamma_lhs=0.0`
 - Safety variant: `delta_gate_ent_q=0.6`
+- RotatE defaults: `emb_dim=1000`, `margin=12.0`, `batch_size=1024`, `num_neg=256`, `lr=1e-4`, `epochs=200`, `adv_sampling=true`, `adv_temp=1.0`

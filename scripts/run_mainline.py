@@ -31,6 +31,7 @@ def main():
     ap.add_argument("--b_lhs", type=float, default=2.5)
     ap.add_argument("--gamma_rhs", type=float, default=2.0)
     ap.add_argument("--gamma_lhs", type=float, default=0.0)
+    ap.add_argument("--eval_recall_k", type=int, default=200)
     args = ap.parse_args()
 
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -62,7 +63,18 @@ def main():
 
     run([sys.executable, "train/train_rotate.py",
          "--data_path", data_path,
-         "--save_dir", rotate_dir])
+         "--save_dir", rotate_dir,
+         "--emb_dim", "1000",
+         "--margin", "12.0",
+         "--batch_size", "1024",
+         "--num_neg", "256",
+         "--lr", "1e-4",
+         "--epochs", "200",
+         "--eval_every", "10",
+         "--eval_split", "valid",
+         "--eval_recall_k", str(args.eval_recall_k),
+         "--negative_adversarial_sampling",
+         "--adversarial_temperature", "1.0"])
 
     run([sys.executable, "build/build_rotate_cache_rhs_topk.py",
          "--data_path", data_path,

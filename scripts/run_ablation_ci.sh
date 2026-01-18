@@ -28,6 +28,7 @@ echo "[Ablation] R0 full-entity RotatE"
 python eval/eval_full_entity_filtered.py \
   --data_path "${DATA}" \
   --pretrained_rotate "${ROTATE}" \
+  --recall_k "${TOPK}" \
   --eval_split test --eval_sides both \
   --out_dir "${ROOT}/eval/R0_rotate_full"
 

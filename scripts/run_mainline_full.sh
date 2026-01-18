@@ -10,6 +10,7 @@ set -euo pipefail
 # Run from repo root. This script does NOT download datasets.
 
 DATASET_NAME="${1:-fb15k_custom}"
+RECALL_K="${2:-200}"
 DATA_PATH="data/${DATASET_NAME}"
 
 # ---- checkpoint dirs ----
@@ -42,7 +43,18 @@ GAMMA_LHS=0.0
 echo "[1/6] Train RotatE"
 python train/train_rotate.py \
   --data_path "${DATA_PATH}" \
-  --save_dir "${ROTATE_DIR}"
+  --save_dir "${ROTATE_DIR}" \
+  --emb_dim 1000 \
+  --margin 12.0 \
+  --batch_size 1024 \
+  --num_neg 256 \
+  --lr 1e-4 \
+  --epochs 200 \
+  --eval_every 10 \
+  --eval_split valid \
+  --eval_recall_k "${RECALL_K}" \
+  --negative_adversarial_sampling \
+  --adversarial_temperature 1.0
 
 echo "[2/6] Build TopK hard-negative caches (train+valid filtered)"
 python build/build_rotate_cache_rhs_topk.py \
