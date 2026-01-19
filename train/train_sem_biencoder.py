@@ -204,7 +204,7 @@ def main():
     ap.add_argument("--eval_batch_size", type=int, default=16)
     ap.add_argument("--eval_chunk_size", type=int, default=2048)
     ap.add_argument("--eval_sem_rhs_only", action="store_true")  # strongly recommended for bi-encoder first stage
-    ap.add_argument("--eval_mode", type=str, default="topk", choices=["full", "topk"])
+    ap.add_argument("--eval_mode", type=str, default="full", choices=["full", "topk"])
     ap.add_argument("--eval_metric", type=str, default="avg", choices=["rhs", "avg"])
     ap.add_argument("--eval_topk", type=int, default=200)
     ap.add_argument("--eval_b_rhs", type=float, default=1.0)

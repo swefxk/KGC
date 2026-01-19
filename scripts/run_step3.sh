@@ -35,7 +35,6 @@ echo "[3/6] Train Semantic Bi-Encoder (SimKGC-style, bidirectional)"
   --train_cache_rhs "${RHS_CACHE}" \
   --train_cache_lhs "${LHS_CACHE}" \
   --save_dir "${SEM_DIR}" \
-  --eval_mode topk \
   --eval_metric avg \
   --epochs 10
 

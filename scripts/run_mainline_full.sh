@@ -90,7 +90,6 @@ python train/train_sem_biencoder.py \
   --train_cache_rhs "${RHS_CACHE_TV}" \
   --train_cache_lhs "${LHS_CACHE_TV}" \
   --save_dir "${SEM_DIR}" \
-  --eval_mode topk \
   --eval_metric avg \
   --epochs 10
 
