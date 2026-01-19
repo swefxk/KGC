@@ -17,10 +17,16 @@ BOOT_SAMPLES=2000
 BOOT_SEED=42
 BOOT_CI=0.95
 
-ROTATE="${ROOT}/checkpoints/rotate/best_model.pth"
-SEM="${ROOT}/checkpoints/sem_biencoder/biencoder_best.pth"
-GATE="${ROOT}/checkpoints/gate/gate_best.pth"
-REFINER="${ROOT}/checkpoints/refiner/refiner_best.pth"
+CKPT_ROOT="${ROOT}/checkpoints"
+if [ ! -f "${CKPT_ROOT}/rotate/best_model.pth" ]; then
+  CKPT_ROOT="checkpoints/${RUN}"
+fi
+
+ROTATE="${CKPT_ROOT}/rotate/best_model.pth"
+SEM="${CKPT_ROOT}/sem_biencoder/biencoder_best.pth"
+SEM_INDEP="${CKPT_ROOT}/sem_biencoder_indep/biencoder_best.pth"
+GATE="${CKPT_ROOT}/gate/gate_best.pth"
+REFINER="${CKPT_ROOT}/refiner/refiner_best.pth"
 
 mkdir -p "${ROOT}/eval"
 
@@ -29,7 +35,7 @@ python eval/eval_full_entity_filtered.py \
   --data_path "${DATA}" \
   --pretrained_rotate "${ROTATE}" \
   --recall_k "${TOPK}" \
-  --eval_split test --eval_sides both \
+  --eval_split test \
   --out_dir "${ROOT}/eval/R0_rotate_full"
 
 echo "[Ablation] R0-topK (topK-only, b=0, gamma=0)"
@@ -41,15 +47,47 @@ python eval/eval_topk_inject.py \
   --refiner_gamma_rhs 0.0 --refiner_gamma_lhs 0.0 \
   --out_dir "${ROOT}/eval/R0_rotate_topk"
 
-echo "[Ablation] Sem-only (no gate, no delta)"
+echo "[Ablation] Sem-only (same candidates; struct_weight=0)"
 python eval/eval_topk_inject.py \
   --data_path "${DATA}" \
   --pretrained_rotate "${ROTATE}" \
   --pretrained_sem "${SEM}" \
+  --struct_weight_rhs 0.0 --struct_weight_lhs 0.0 \
   --topk "${TOPK}" --b_rhs "${B_RHS}" --b_lhs "${B_LHS}" \
   --eval_split test --eval_sides both \
   --refiner_gamma_rhs 0.0 --refiner_gamma_lhs 0.0 \
   --out_dir "${ROOT}/eval/Sem_only"
+
+echo "[Ablation] Sem-only Full-Entity (biencoder retrieval)"
+python eval/eval_sem_biencoder_full.py \
+  --data_path "${DATA}" \
+  --pretrained_sem "${SEM}" \
+  --topk "${TOPK}" \
+  --eval_split test --eval_sides both \
+  --out_dir "${ROOT}/eval/Sem_only_full"
+
+if [ -f "${SEM_INDEP}" ]; then
+  echo "[Ablation] Sem-only-IND (independent sem model)"
+  python eval/eval_topk_inject.py \
+    --data_path "${DATA}" \
+    --pretrained_rotate "${ROTATE}" \
+    --pretrained_sem "${SEM_INDEP}" \
+    --struct_weight_rhs 0.0 --struct_weight_lhs 0.0 \
+    --topk "${TOPK}" --b_rhs "${B_RHS}" --b_lhs "${B_LHS}" \
+    --eval_split test --eval_sides both \
+    --refiner_gamma_rhs 0.0 --refiner_gamma_lhs 0.0 \
+    --out_dir "${ROOT}/eval/Sem_only_indep"
+
+  echo "[Ablation] Sem-only-IND Full-Entity (biencoder retrieval)"
+  python eval/eval_sem_biencoder_full.py \
+    --data_path "${DATA}" \
+    --pretrained_sem "${SEM_INDEP}" \
+    --topk "${TOPK}" \
+    --eval_split test --eval_sides both \
+    --out_dir "${ROOT}/eval/Sem_only_indep_full"
+else
+  echo "[Ablation] Sem-only-IND skipped (missing ${SEM_INDEP})"
+fi
 
 echo "[Ablation] C: Sem+Gate (no delta)"
 python eval/eval_topk_inject.py \
@@ -85,6 +123,17 @@ python eval/eval_topk_inject.py \
   --eval_split test --eval_sides both \
   --refiner_gamma_rhs "${GAMMA_RHS}" --refiner_gamma_lhs "${GAMMA_LHS}" \
   --out_dir "${ROOT}/eval/Delta_only"
+
+echo "[Ablation] Hybrid LHS (RotatE ∪ Sem candidates, Union@400=200+200)"
+python eval/eval_topk_inject.py \
+  --data_path "${DATA}" \
+  --pretrained_rotate "${ROTATE}" \
+  --pretrained_sem "${SEM}" \
+  --topk "${TOPK}" --b_rhs "${B_RHS}" --b_lhs "${B_LHS}" \
+  --eval_split test --eval_sides lhs \
+  --lhs_union_sem_topk "${TOPK}" \
+  --refiner_gamma_rhs 0.0 --refiner_gamma_lhs 0.0 \
+  --out_dir "${ROOT}/eval/Hybrid_union_lhs"
 
 echo "[Ablation] Safety: entropy gating (q=0.6)"
 python eval/eval_topk_inject.py \

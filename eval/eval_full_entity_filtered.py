@@ -158,6 +158,7 @@ def eval_chunked_bidirectional(
         verbose_every=50,
         refiner_diag=False,
         recall_k=200,
+        rel_bucket_map=None,
 ):
     rotate_model.eval()
     if refiner:
@@ -199,6 +200,7 @@ def eval_chunked_bidirectional(
     print("Calculating Frequency Buckets...")
     bucket_map = get_freq_buckets(processor, device)
     bucket_names = {0: "Tail", 1: "Torso", 2: "Head"}
+    rel_bucket_names = {0: "1-1", 1: "1-N", 2: "N-1", 3: "N-N"}
 
     num_ent = processor.num_entities
     all_ent_ids = torch.arange(num_ent, device=device)
@@ -208,6 +210,13 @@ def eval_chunked_bidirectional(
         "rhs": {k: {"mrr": 0.0, "h1": 0, "h3": 0, "h10": 0, "rec": 0, "n": 0} for k in keys},
         "lhs": {k: {"mrr": 0.0, "h1": 0, "h3": 0, "h10": 0, "rec": 0, "n": 0} for k in keys},
     }
+    rel_stats = None
+    if rel_bucket_map is not None:
+        rel_keys = ["total", 0, 1, 2, 3]
+        rel_stats = {
+            "rhs": {k: {"mrr": 0.0, "h1": 0, "h3": 0, "h10": 0, "rec": 0, "n": 0} for k in rel_keys},
+            "lhs": {k: {"mrr": 0.0, "h1": 0, "h3": 0, "h10": 0, "rec": 0, "n": 0} for k in rel_keys},
+        }
 
     ref_diag = None
     if refiner_diag and refiner is not None:
@@ -307,7 +316,7 @@ def eval_chunked_bidirectional(
             out[:, s:e] = (lam * delta).view(B, c)
         return out
 
-    def update_stats(side, rank, target_ids):
+    def update_stats(side, rank, target_ids, rel_ids):
         mrr_val = (1.0 / rank.float())
         h1_val = (rank <= 1)
         h3_val = (rank <= 3)
@@ -331,6 +340,24 @@ def eval_chunked_bidirectional(
                 stats[side][bid]["h10"] += h10_val[mask].sum().item()
                 stats[side][bid]["rec"] += rec_val[mask].sum().item()
                 stats[side][bid]["n"] += int(mask.sum().item())
+
+        if rel_stats is not None:
+            rb = rel_bucket_map[rel_ids]
+            rel_stats[side]["total"]["mrr"] += mrr_val.sum().item()
+            rel_stats[side]["total"]["h1"] += h1_val.sum().item()
+            rel_stats[side]["total"]["h3"] += h3_val.sum().item()
+            rel_stats[side]["total"]["h10"] += h10_val.sum().item()
+            rel_stats[side]["total"]["rec"] += rec_val.sum().item()
+            rel_stats[side]["total"]["n"] += int(rel_ids.numel())
+            for bid in [0, 1, 2, 3]:
+                mask = (rb == bid)
+                if mask.any():
+                    rel_stats[side][bid]["mrr"] += mrr_val[mask].sum().item()
+                    rel_stats[side][bid]["h1"] += h1_val[mask].sum().item()
+                    rel_stats[side][bid]["h3"] += h3_val[mask].sum().item()
+                    rel_stats[side][bid]["h10"] += h10_val[mask].sum().item()
+                    rel_stats[side][bid]["rec"] += rec_val[mask].sum().item()
+                    rel_stats[side][bid]["n"] += int(mask.sum().item())
 
     print(f"Start Bidirectional Evaluation (split={eval_split}, Chunk={chunk_size}, SemSubChunk={sem_subchunk}, Bisect Optimized)...")
     for b_idx, batch in enumerate(test_loader):
@@ -467,7 +494,7 @@ def eval_chunked_bidirectional(
             rank = greater - greater_struct_topk + greater_ref_topk + 1
         else:
             rank = greater + 1
-        update_stats("rhs", rank, t)
+        update_stats("rhs", rank, t, r)
 
         # ======================
         # LHS: predict h
@@ -586,7 +613,7 @@ def eval_chunked_bidirectional(
             rank = greater - greater_struct_topk + greater_ref_topk + 1
         else:
             rank = greater + 1
-        update_stats("lhs", rank, h)
+        update_stats("lhs", rank, h, r)
 
         if verbose_every and (b_idx + 1) % verbose_every == 0:
             print(f"Evaluated {b_idx + 1} batches...")
@@ -641,6 +668,35 @@ def eval_chunked_bidirectional(
 
     print(f"OVERALL    | AVG      | {avg_mrr:.4f}   | {avg_h1:.4f}   | {avg_h3:.4f}   | {avg_h10:.4f}   | {avg_rec:.4f}   | {n_total * 2:<8}")
     print("=" * 60 + "\n")
+
+    if rel_stats is not None:
+        print("\n" + "=" * 60)
+        print("[Relation Bucket] 1-1 / 1-N / N-1 / N-N")
+        print(f"{'Metric':<10} | {'RelType':<8} | {'MRR':<8} | {'H@1':<8} | {'H@3':<8} | {'H@10':<8} | {'Rec@K':<8} | {'Count':<8}")
+        print("-" * 60)
+        for side in ["rhs", "lhs"]:
+            n_total = max(rel_stats[side]["total"]["n"], 1)
+            for bid in [0, 1, 2, 3]:
+                n_b = max(rel_stats[side][bid]["n"], 1)
+                bname = rel_bucket_names[bid]
+                row_name = f"{side.upper()} {bname}"
+                print(
+                    f"{row_name:<10} | {bname:<8} | "
+                    f"{(rel_stats[side][bid]['mrr'] / n_b):.4f}   | "
+                    f"{(rel_stats[side][bid]['h1'] / n_b):.4f}   | "
+                    f"{(rel_stats[side][bid]['h3'] / n_b):.4f}   | "
+                    f"{(rel_stats[side][bid]['h10'] / n_b):.4f}   | "
+                    f"{(rel_stats[side][bid]['rec'] / n_b):.4f}   | {n_b:<8}"
+                )
+            print(
+                f"{side.upper()} TOTAL | ALL      | "
+                f"{(rel_stats[side]['total']['mrr'] / n_total):.4f}   | "
+                f"{(rel_stats[side]['total']['h1'] / n_total):.4f}   | "
+                f"{(rel_stats[side]['total']['h3'] / n_total):.4f}   | "
+                f"{(rel_stats[side]['total']['h10'] / n_total):.4f}   | "
+                f"{(rel_stats[side]['total']['rec'] / n_total):.4f}   | {n_total:<8}"
+            )
+            print("-" * 60)
 
     if ref_diag is not None and ref_diag["p_up_den"] > 0:
         def _q(vals, q):
@@ -698,8 +754,10 @@ def main():
     parser.add_argument("--eval_split", type=str, default="test", choices=["valid", "test"])
     parser.add_argument("--out_dir", type=str, default=None)
     parser.add_argument("--recall_k", type=int, default=200)
+    parser.add_argument("--rel_bucket_map", type=str, default=None,
+                        help="Path to relation_type_map.json for 1-1/1-N/N-1/N-N bucket stats")
 
-    parser.add_argument("--emb_dim", type=int, default=500)
+    parser.add_argument("--emb_dim", type=int, default=1000)
     parser.add_argument("--margin", type=float, default=9.0)
 
     parser.add_argument("--lambda_sem", type=float, default=0.05)
@@ -721,6 +779,22 @@ def main():
 
     processor = KGProcessor(args.data_path, max_neighbors=args.K)
     processor.load_files()
+
+    rel_bucket_map = None
+    if args.rel_bucket_map:
+        with open(args.rel_bucket_map, "r", encoding="utf-8") as f:
+            rel_map = json.load(f)
+        rel_bucket_map = torch.full((processor.num_relations,), -1, dtype=torch.long, device=device)
+        for rid, rname in processor.id2relation.items():
+            rtype = rel_map.get(rname)
+            if rtype == "1-1":
+                rel_bucket_map[rid] = 0
+            elif rtype == "1-N":
+                rel_bucket_map[rid] = 1
+            elif rtype == "N-1":
+                rel_bucket_map[rid] = 2
+            elif rtype == "N-N":
+                rel_bucket_map[rid] = 3
 
     if not args.disable_refiner:
         processor.nbr_ent = processor.nbr_ent.to(device)
@@ -805,6 +879,7 @@ def main():
         print_sem_stats=args.print_sem_stats,
         refiner_diag=args.refiner_diag,
         recall_k=args.recall_k,
+        rel_bucket_map=rel_bucket_map,
     )
 
     # save metrics.json

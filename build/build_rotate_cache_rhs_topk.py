@@ -103,7 +103,7 @@ def main():
     processor = KGProcessor(args.data_path, max_neighbors=16)
     processor.load_files()
 
-    rotate_model = RotatEModel(processor.num_entities, processor.num_relations, emb_dim=500, margin=9.0).to(device)
+    rotate_model = RotatEModel(processor.num_entities, processor.num_relations, emb_dim=1000, margin=9.0).to(device)
     rotate_model.load_state_dict(torch.load(args.pretrained_rotate, map_location=device))
     rotate_model.eval()
 

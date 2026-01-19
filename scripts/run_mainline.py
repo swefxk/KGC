@@ -65,7 +65,7 @@ def main():
          "--data_path", data_path,
          "--save_dir", rotate_dir,
          "--emb_dim", "1000",
-         "--margin", "12.0",
+         "--margin", "9.0",
          "--batch_size", "1024",
          "--num_neg", "256",
          "--lr", "1e-4",

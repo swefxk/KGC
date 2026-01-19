@@ -307,7 +307,7 @@ def main():
     parser.add_argument("--pretrained_rotate", type=str, required=True)
     parser.add_argument("--save_dir", type=str, default="checkpoints/struct_refiner")
 
-    parser.add_argument("--emb_dim", type=int, default=500)
+    parser.add_argument("--emb_dim", type=int, default=1000)
     parser.add_argument("--margin", type=float, default=9.0)
 
     parser.add_argument("--K", type=int, default=16)

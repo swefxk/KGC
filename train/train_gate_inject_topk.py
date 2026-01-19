@@ -112,6 +112,7 @@ def main():
     ap.add_argument("--pretrained_sem", type=str, required=True)
     ap.add_argument("--train_cache_rhs", type=str, required=True)
     ap.add_argument("--train_cache_lhs", type=str, required=True)
+    ap.add_argument("--emb_dim", type=int, default=1000, help="RotatE embedding dim")
 
     ap.add_argument("--b_rhs", type=float, default=2.0)
     ap.add_argument("--b_lhs", type=float, default=2.5)
@@ -156,7 +157,12 @@ def main():
         raise ValueError("Cache rows do not match train size.")
 
     # models (frozen)
-    rotate = RotatEModel(processor.num_entities, processor.num_relations, emb_dim=500, margin=9.0).to(device)
+    rotate = RotatEModel(
+        processor.num_entities,
+        processor.num_relations,
+        emb_dim=args.emb_dim,
+        margin=9.0,
+    ).to(device)
     rotate.load_state_dict(torch.load(args.pretrained_rotate, map_location=device))
     rotate.eval()
     for p in rotate.parameters():
@@ -166,7 +172,7 @@ def main():
     nbr_ent = nbr_rel = nbr_dir = nbr_mask = freq = None
     if args.pretrained_refiner:
         refiner = StructRefiner(
-            emb_dim=500,
+            emb_dim=args.emb_dim,
             K=16,
             num_relations=processor.num_relations,
         ).to(device)
