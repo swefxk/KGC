@@ -97,6 +97,9 @@ def main():
          "--train_cache_rhs", rhs_cache,
          "--train_cache_lhs", lhs_cache,
          "--save_dir", sem_dir,
+         "--eval_topk", str(args.topk),
+         "--eval_b_rhs", str(args.b_rhs),
+         "--eval_b_lhs", str(args.b_lhs),
          "--epochs", str(args.epochs_sem)])
 
     run([sys.executable, "train/train_struct_refiner.py",

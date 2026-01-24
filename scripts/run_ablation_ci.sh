@@ -19,7 +19,8 @@ BOOT_CI=0.95
 
 CKPT_ROOT="${ROOT}/checkpoints"
 if [ ! -f "${CKPT_ROOT}/rotate/best_model.pth" ]; then
-  CKPT_ROOT="checkpoints/${RUN}"
+  echo "[Error] Missing checkpoints under ${CKPT_ROOT}. Run mainline first."
+  exit 1
 fi
 
 ROTATE="${CKPT_ROOT}/rotate/best_model.pth"
@@ -36,18 +37,37 @@ python eval/eval_full_entity_filtered.py \
   --pretrained_rotate "${ROTATE}" \
   --recall_k "${TOPK}" \
   --eval_split test \
-  --out_dir "${ROOT}/eval/R0_rotate_full"
+  --out_dir "${ROOT}/eval/R0_rotate_full" \
+  --save_ranks_path "${ROOT}/eval/R0_rotate_full/ranks.pt"
 
 echo "[Ablation] R0-topK (topK-only, b=0, gamma=0)"
 python eval/eval_topk_inject.py \
   --data_path "${DATA}" \
   --pretrained_rotate "${ROTATE}" \
+  --strict_r0 \
   --topk "${TOPK}" --b_rhs 0.0 --b_lhs 0.0 \
   --eval_split test --eval_sides both \
   --refiner_gamma_rhs 0.0 --refiner_gamma_lhs 0.0 \
-  --out_dir "${ROOT}/eval/R0_rotate_topk"
+  --out_dir "${ROOT}/eval/R0_rotate_topk" \
+  --save_ranks_path "${ROOT}/eval/R0_rotate_topk/ranks.pt"
 
-echo "[Ablation] Sem-only (same candidates; struct_weight=0)"
+echo "[Check] R0 ranks consistency (full vs topK strict)"
+python - <<PY
+import sys
+import torch
+
+full = torch.load("${ROOT}/eval/R0_rotate_full/ranks.pt", map_location="cpu")
+topk = torch.load("${ROOT}/eval/R0_rotate_topk/ranks.pt", map_location="cpu")
+
+for key in ("rhs_ranks", "lhs_ranks"):
+    diff = (full[key] != topk[key]).sum().item()
+    if diff:
+        print(f"[Error] R0 mismatch in {key}: {diff} diffs")
+        sys.exit(1)
+print("[OK] R0 full-entity and topK strict ranks match")
+PY
+
+echo "[Ablation] Sem (TopK rerank; candidates from RotatE, struct_weight=0)"
 python eval/eval_topk_inject.py \
   --data_path "${DATA}" \
   --pretrained_rotate "${ROTATE}" \
@@ -56,37 +76,18 @@ python eval/eval_topk_inject.py \
   --topk "${TOPK}" --b_rhs "${B_RHS}" --b_lhs "${B_LHS}" \
   --eval_split test --eval_sides both \
   --refiner_gamma_rhs 0.0 --refiner_gamma_lhs 0.0 \
-  --out_dir "${ROOT}/eval/Sem_only"
-
-echo "[Ablation] Sem-only Full-Entity (biencoder retrieval)"
-python eval/eval_sem_biencoder_full.py \
-  --data_path "${DATA}" \
-  --pretrained_sem "${SEM}" \
-  --topk "${TOPK}" \
-  --eval_split test --eval_sides both \
-  --out_dir "${ROOT}/eval/Sem_only_full"
+  --out_dir "${ROOT}/eval/Sem_rerank_topk"
 
 if [ -f "${SEM_INDEP}" ]; then
-  echo "[Ablation] Sem-only-IND (independent sem model)"
-  python eval/eval_topk_inject.py \
-    --data_path "${DATA}" \
-    --pretrained_rotate "${ROTATE}" \
-    --pretrained_sem "${SEM_INDEP}" \
-    --struct_weight_rhs 0.0 --struct_weight_lhs 0.0 \
-    --topk "${TOPK}" --b_rhs "${B_RHS}" --b_lhs "${B_LHS}" \
-    --eval_split test --eval_sides both \
-    --refiner_gamma_rhs 0.0 --refiner_gamma_lhs 0.0 \
-    --out_dir "${ROOT}/eval/Sem_only_indep"
-
-  echo "[Ablation] Sem-only-IND Full-Entity (biencoder retrieval)"
+  echo "[Ablation] Sem-only Full-Entity (independent biencoder)"
   python eval/eval_sem_biencoder_full.py \
     --data_path "${DATA}" \
     --pretrained_sem "${SEM_INDEP}" \
     --topk "${TOPK}" \
     --eval_split test --eval_sides both \
-    --out_dir "${ROOT}/eval/Sem_only_indep_full"
+    --out_dir "${ROOT}/eval/Sem_only_full"
 else
-  echo "[Ablation] Sem-only-IND skipped (missing ${SEM_INDEP})"
+  echo "[Ablation] Sem-only Full-Entity skipped (missing ${SEM_INDEP})"
 fi
 
 echo "[Ablation] C: Sem+Gate (no delta)"
@@ -124,7 +125,7 @@ python eval/eval_topk_inject.py \
   --refiner_gamma_rhs "${GAMMA_RHS}" --refiner_gamma_lhs "${GAMMA_LHS}" \
   --out_dir "${ROOT}/eval/Delta_only"
 
-echo "[Ablation] Hybrid LHS (RotatE ∪ Sem candidates, Union@400=200+200)"
+echo "[Ablation] Hybrid LHS (RotatE union Sem, unionK=400)"
 python eval/eval_topk_inject.py \
   --data_path "${DATA}" \
   --pretrained_rotate "${ROTATE}" \
@@ -135,7 +136,7 @@ python eval/eval_topk_inject.py \
   --refiner_gamma_rhs 0.0 --refiner_gamma_lhs 0.0 \
   --out_dir "${ROOT}/eval/Hybrid_union_lhs"
 
-echo "[Ablation] Safety: entropy gating (q=0.6)"
+echo "[Ablation] Safety: entropy gating q=0.6"
 python eval/eval_topk_inject.py \
   --data_path "${DATA}" \
   --pretrained_rotate "${ROTATE}" \
@@ -148,7 +149,8 @@ python eval/eval_topk_inject.py \
   --delta_gate_ent_q 0.6 \
   --out_dir "${ROOT}/eval/Safety_entropy_q06"
 
-echo "[Ablation] Paired bootstrap D−C (ΔMRR)"
+echo "[Ablation] Paired bootstrap D-C (Delta MRR)"
+mkdir -p "${ROOT}/eval/BOOT_D_minus_C"
 python eval/eval_topk_inject.py \
   --data_path "${DATA}" \
   --pretrained_rotate "${ROTATE}" \

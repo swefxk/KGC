@@ -16,6 +16,7 @@ sys.path.append(os.getcwd())
 from data.data_loader import KGProcessor, TrainDataset
 from models.rotate import RotatEModel
 from eval.eval_full_entity_filtered import load_embeddings, build_to_skip, eval_chunked_bidirectional
+from eval.eval_sem_biencoder_full import build_sem_index, eval_sem_only
 from eval.eval_topk_inject import eval_rhs_topk_inject, eval_lhs_topk_inject
 from tools.run_meta import write_run_metadata
 from models.semantic_biencoder import SemanticBiEncoderScorer
@@ -209,8 +210,10 @@ def main():
     ap.add_argument("--eval_topk", type=int, default=200)
     ap.add_argument("--eval_b_rhs", type=float, default=1.0)
     ap.add_argument("--eval_b_lhs", type=float, default=1.0)
-    ap.add_argument("--eval_struct_weight_rhs", type=float, default=0.0)
-    ap.add_argument("--eval_struct_weight_lhs", type=float, default=0.0)
+    ap.add_argument("--eval_struct_weight_rhs", type=float, default=1.0)
+    ap.add_argument("--eval_struct_weight_lhs", type=float, default=1.0)
+    ap.add_argument("--eval_sem_only_every", type=int, default=5,
+                    help="run sem-only full-entity eval every N epochs (A)")
 
     args = ap.parse_args()
     set_seed(args.seed)
@@ -259,15 +262,15 @@ def main():
     # ---- cache (CPU!) ----
     cache_neg_t = None
     if args.neg_source == "cache":
-        cache_rhs_path = args.train_cache_rhs or args.train_cache
-        if not cache_rhs_path:
+    cache_rhs_path = args.train_cache_rhs or args.train_cache
+    if not cache_rhs_path:
             raise ValueError("Need --train_cache_rhs (or legacy --train_cache) when neg_source=cache.")
-        cache = torch.load(cache_rhs_path, map_location="cpu")
-        cache_neg_t = cache["neg_t"] if isinstance(cache, dict) and "neg_t" in cache else cache
-        cache_neg_t = cache_neg_t.to(torch.long).contiguous()  # CPU
-        if cache_neg_t.size(0) != processor.train_triplets.size(0):
-            raise ValueError(f"RHS cache rows={cache_neg_t.size(0)} != num_train={processor.train_triplets.size(0)}")
-        print(f"[Cache] neg_t CPU: {tuple(cache_neg_t.shape)} dtype={cache_neg_t.dtype}")
+    cache = torch.load(cache_rhs_path, map_location="cpu")
+    cache_neg_t = cache["neg_t"] if isinstance(cache, dict) and "neg_t" in cache else cache
+    cache_neg_t = cache_neg_t.to(torch.long).contiguous()  # CPU
+    if cache_neg_t.size(0) != processor.train_triplets.size(0):
+        raise ValueError(f"RHS cache rows={cache_neg_t.size(0)} != num_train={processor.train_triplets.size(0)}")
+    print(f"[Cache] neg_t CPU: {tuple(cache_neg_t.shape)} dtype={cache_neg_t.dtype}")
     else:
         print("[Cache] neg_source=random (no RotatE cache used)")
 
@@ -289,10 +292,10 @@ def main():
             emb_dim=args.emb_dim,
             margin=9.0,
         ).to(device)
-        rotate_model.load_state_dict(torch.load(args.pretrained_rotate, map_location=device))
-        rotate_model.eval()
-        for p in rotate_model.parameters():
-            p.requires_grad = False
+    rotate_model.load_state_dict(torch.load(args.pretrained_rotate, map_location=device))
+    rotate_model.eval()
+    for p in rotate_model.parameters():
+        p.requires_grad = False
 
     # ---- embeddings (frozen tensors) ----
     ent_embs, rel_embs = load_embeddings(processor, args, device)
@@ -319,7 +322,7 @@ def main():
 
     queue = PreBatchQueue(args.queue_size, args.proj_dim, device=device) if args.queue_size > 0 else None
 
-    best_rhs = -1.0
+    best_metric = -1.0
     save_path = os.path.join(args.save_dir, "biencoder_best.pth")
     to_skip_valid = build_to_skip(processor, split="valid")
 
@@ -347,7 +350,7 @@ def main():
             # sample negatives on CPU then move
             row_idx_cpu = row_idx.cpu()
             if cache_neg_t is not None:
-                hard_cpu = sample_hard_from_cache_cpu(cache_neg_t, row_idx_cpu, args.hard_k)  # CPU [B,Kh]
+            hard_cpu = sample_hard_from_cache_cpu(cache_neg_t, row_idx_cpu, args.hard_k)  # CPU [B,Kh]
             else:
                 hard_cpu = torch.randint(
                     0, processor.num_entities, (h.size(0), args.hard_k), dtype=torch.long
@@ -434,8 +437,8 @@ def main():
 
                 # ---- optional LHS (hard-only or random) ----
                 if cache_neg_h is not None or (args.neg_source == "random" and args.random_lhs):
-                    if cache_neg_h is not None:
-                        hard_h_cpu = sample_hard_from_cache_cpu(cache_neg_h, row_idx_cpu, args.hard_k)
+                if cache_neg_h is not None:
+                    hard_h_cpu = sample_hard_from_cache_cpu(cache_neg_h, row_idx_cpu, args.hard_k)
                     else:
                         hard_h_cpu = torch.randint(
                             0, processor.num_entities, (h.size(0), args.hard_k), dtype=torch.long
@@ -498,35 +501,16 @@ def main():
                     f"margin_hard_lhs={stat_margin_lhs/max(1,stat_cnt):.4f}")
         print(msg)
 
-        # ---- Eval (full-entity filtered, but recommend sem_rhs_only during this phase) ----
+        # ---- Eval: A (sem-only full-entity) + B (topK proxy) ----
         if args.eval_every and (epoch % args.eval_every == 0):
-            if rotate_model is None:
-                raise ValueError("eval_every requires --pretrained_rotate for full-entity eval.")
             sem_model.eval()
-            if args.eval_mode == "full":
-                print("Evaluating on VALID (full-entities filtered)...")
-                metrics = eval_chunked_bidirectional(
-                    processor=processor,
-                    rotate_model=rotate_model,
-                    test_loader=valid_loader,
-                    device=device,
-                    to_skip=to_skip_valid,
-                    eval_split="valid",
-                    refiner=None,
-                    semres_model=sem_model,       # bi-encoder implements forward(delta,lam)
-                    ent_text_embs=ent_embs,
-                    rel_text_embs=rel_embs,
-                    chunk_size=args.eval_chunk_size,
-                    sem_subchunk=256,
-                    disable_refiner=True,
-                    disable_semres=False,
-                    sem_rhs_only=args.eval_sem_rhs_only,
-                    verbose_every=0,
-                )
-                rhs = metrics["rhs"]["total"]["MRR"]
-                lhs = metrics["lhs"]["total"]["MRR"]
-            else:
-                print("Evaluating on VALID (topK, sem-only rerank)...")
+            metric_name = "avg" if args.eval_metric == "avg" else "rhs"
+            metric = None
+            rhs = lhs = avg = None
+
+            # B: topK proxy (system-aligned)
+            if rotate_model is not None:
+                print("Evaluating on VALID (topK proxy, system-aligned)...")
                 eval_loader = DataLoader(
                     TrainDataset(processor.valid_triplets),
                     batch_size=args.eval_batch_size,
@@ -536,8 +520,8 @@ def main():
                     drop_last=False,
                 )
                 rhs_stats, _, _ = eval_rhs_topk_inject(
-                    processor=processor,
-                    rotate_model=rotate_model,
+                processor=processor,
+                rotate_model=rotate_model,
                     sem_model=sem_model,
                     ent_text_embs=ent_embs,
                     rel_text_embs=rel_embs,
@@ -552,7 +536,7 @@ def main():
                     loader=eval_loader,
                     to_skip=to_skip_valid,
                     split="valid",
-                    device=device,
+                device=device,
                     topk=args.eval_topk,
                     chunk_size=args.eval_chunk_size,
                     b_scale=args.eval_b_rhs,
@@ -575,8 +559,8 @@ def main():
                     processor=processor,
                     rotate_model=rotate_model,
                     sem_model=sem_model,
-                    ent_text_embs=ent_embs,
-                    rel_text_embs=rel_embs,
+                ent_text_embs=ent_embs,
+                rel_text_embs=rel_embs,
                     refiner=None,
                     nbr_ent=None,
                     nbr_rel=None,
@@ -590,7 +574,7 @@ def main():
                     split="valid",
                     device=device,
                     topk=args.eval_topk,
-                    chunk_size=args.eval_chunk_size,
+                chunk_size=args.eval_chunk_size,
                     b_scale=args.eval_b_lhs,
                     get_b_fn=None,
                     refiner_gamma=0.0,
@@ -610,13 +594,43 @@ def main():
                 )
                 rhs = rhs_stats["total"]["mrr"] / max(1, rhs_stats["total"]["n"])
                 lhs = lhs_stats["total"]["mrr"] / max(1, lhs_stats["total"]["n"])
+                avg = 0.5 * (rhs + lhs)
+                print(f"[VALID][TopK] RHS={rhs:.4f} | LHS={lhs:.4f} | AVG={avg:.4f}")
+                metric = avg if metric_name == "avg" else rhs
+            else:
+                print("[WARN] pretrained_rotate not provided; skipping topK proxy (B).")
 
-            avg = 0.5 * (rhs + lhs)
-            print(f"[VALID] RHS MRR: {rhs:.4f} | LHS MRR: {lhs:.4f} | AVG: {avg:.4f}")
-            metric = avg if args.eval_metric == "avg" else rhs
+            # A: sem-only full-entity (ablation evidence)
+            run_sem_only = True if rotate_model is None else (
+                args.eval_sem_only_every > 0 and (epoch % args.eval_sem_only_every == 0)
+            )
+            if run_sem_only:
+                print("Evaluating on VALID (Sem-only full-entity)...")
+                ent_index, rel0, rel1 = build_sem_index(
+                    sem_model, ent_embs, rel_embs, device=device, batch_size=1024
+                )
+                stats_rhs = eval_sem_only(
+                    processor, sem_model, ent_index, rel0, rel1,
+                    valid_loader, to_skip_valid, device,
+                    topk=args.eval_topk, chunk_size=args.eval_chunk_size, eval_side="rhs",
+                )
+                stats_lhs = eval_sem_only(
+                    processor, sem_model, ent_index, rel0, rel1,
+                    valid_loader, to_skip_valid, device,
+                    topk=args.eval_topk, chunk_size=args.eval_chunk_size, eval_side="lhs",
+                )
+                rhs_a = stats_rhs["mrr"] / max(1, stats_rhs["n"])
+                lhs_a = stats_lhs["mrr"] / max(1, stats_lhs["n"])
+                avg_a = 0.5 * (rhs_a + lhs_a)
+                print(f"[VALID][Sem-only] RHS={rhs_a:.4f} | LHS={lhs_a:.4f} | AVG={avg_a:.4f}")
+                if rotate_model is None:
+                    rhs, lhs, avg = rhs_a, lhs_a, avg_a
+                    metric = avg_a if metric_name == "avg" else rhs_a
 
-            if metric > best_rhs:
-                best_rhs = metric
+            if metric is None:
+                continue
+            if metric > best_metric:
+                best_metric = metric
                 ckpt = {
                     "model_type": "biencoder",
                     "model_args": {
@@ -628,15 +642,16 @@ def main():
                     },
                     "state_dict": sem_model.state_dict(),
                     "train_args": vars(args),
-                    "best_valid_metric": float(best_rhs),
+                    "best_valid_metric": float(best_metric),
+                    "best_valid_metric_name": metric_name,
                     "best_valid_rhs": float(rhs),
                     "best_valid_lhs": float(lhs),
                     "best_valid_avg": float(avg),
                 }
                 torch.save(ckpt, save_path)
-                print(f"Saved best to {save_path} (best_valid_metric={best_rhs:.4f})")
+                print(f"Saved best to {save_path} (best_valid_metric={best_metric:.4f})")
 
-    print(f"Done. Best VALID RHS MRR: {best_rhs:.4f}")
+    print(f"Done. Best VALID metric: {best_metric:.4f}")
     print(f"Best checkpoint: {save_path}")
 
 

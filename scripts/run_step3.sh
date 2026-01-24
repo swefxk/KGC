@@ -4,20 +4,25 @@ set -euo pipefail
 # =========================================
 # Continue from Step 3 (after caches built)
 # Usage:
-#   bash scripts/run_step3.sh fb15k_custom
+#   bash scripts/run_step3.sh fb15k_custom <run_id>
 # =========================================
 
 DATASET_NAME="${1:-fb15k_custom}"
+RUN_ID="${2:-mainline_${DATASET_NAME}}"
 DATA_PATH="data/${DATASET_NAME}"
-CKPT_ROOT="checkpoints/mainline_${DATASET_NAME}"
+CKPT_ROOT="artifacts/${RUN_ID}/checkpoints"
+RUN_ROOT="artifacts/${RUN_ID}"
 
 ROTATE_CKPT="${CKPT_ROOT}/rotate/best_model.pth"
 SEM_DIR="${CKPT_ROOT}/sem_biencoder"
 REFINER_DIR="${CKPT_ROOT}/refiner"
 GATE_DIR="${CKPT_ROOT}/gate"
 
-RHS_CACHE="${DATA_PATH}/cache/train_rhs_top500_neg_filtered_trainvalid.pt"
-LHS_CACHE="${DATA_PATH}/cache/train_lhs_top500_neg_filtered_trainvalid.pt"
+CACHE_DIR="${RUN_ROOT}/cache"
+RHS_CACHE="${CACHE_DIR}/train_rhs_top500_neg_filtered_trainvalid.pt"
+LHS_CACHE="${CACHE_DIR}/train_lhs_top500_neg_filtered_trainvalid.pt"
+
+mkdir -p "${RUN_ROOT}" "${SEM_DIR}" "${REFINER_DIR}" "${GATE_DIR}"
 
 TOPK=200
 B_RHS=2.0
@@ -35,6 +40,8 @@ echo "[3/6] Train Semantic Bi-Encoder (SimKGC-style, bidirectional)"
   --train_cache_rhs "${RHS_CACHE}" \
   --train_cache_lhs "${LHS_CACHE}" \
   --save_dir "${SEM_DIR}" \
+  --eval_topk "${TOPK}" \
+  --eval_b_rhs "${B_RHS}" --eval_b_lhs "${B_LHS}" \
   --eval_metric avg \
   --epochs 10
 

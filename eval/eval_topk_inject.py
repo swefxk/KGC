@@ -13,7 +13,12 @@ sys.path.append(os.getcwd())
 
 from data.data_loader import KGProcessor, TrainDataset
 from models.rotate import RotatEModel
-from eval.eval_full_entity_filtered import build_to_skip, load_embeddings, get_freq_buckets
+from eval.eval_full_entity_filtered import (
+    build_to_skip,
+    load_embeddings,
+    get_freq_buckets,
+    eval_chunked_bidirectional,
+)
 
 # biencoder
 from models.semantic_biencoder import SemanticBiEncoderScorer
@@ -21,6 +26,7 @@ from models.struct_refiner import StructRefiner
 from models.gate_injector import ConfidenceGate
 from models.gate_injector import gate_features_from_top_scores
 from tools.run_meta import write_run_metadata
+from tools.repro import setup_reproducibility
 
 
 def get_relation_buckets(processor, device):
@@ -141,6 +147,7 @@ def eval_rhs_topk_inject(
     delta_gate_ent_q=None,
     refiner_viol_only=False,
     refiner_topm=0,
+    score_eps=0.0,
     collect_ranks=False,
     profile_time=False,
     refiner_diag=False,
@@ -184,15 +191,15 @@ def eval_rhs_topk_inject(
         use_refiner_rerank = refiner is not None and hasattr(refiner, "score_delta_topk")
 
         struct_w = float(struct_weight)
-        # gold total
+        # gold total (align scoring path with full-entity eval)
+        conj_flag = torch.zeros(B, dtype=torch.bool, device=device)
         if refiner is None or use_refiner_rerank:
-            s_gold_struct = rotate_model(h, r, t, mode="single")  # [B]
+            anchor_emb = rotate_model.entity_embedding[h]
         else:
             anchor_emb = refiner.refine_anchor(
                 h, rotate_model, nbr_ent, nbr_rel, nbr_dir, nbr_mask, freq
             )
-            conj_flag = torch.zeros(B, dtype=torch.bool, device=device)
-            s_gold_struct = rotate_model.score_from_head_emb(anchor_emb, r, t.unsqueeze(1), conj=conj_flag).squeeze(1)
+        s_gold_struct = rotate_model.score_from_head_emb(anchor_emb, r, t.unsqueeze(1), conj=conj_flag).squeeze(1)
         if use_sem:
             if profile_time:
                 t0 = time.time()
@@ -225,12 +232,11 @@ def eval_rhs_topk_inject(
 
             # struct scores for this chunk: [B,C]
             if refiner is None or use_refiner_rerank:
-                s_chunk = rotate_model(h, r, cand_1d, mode="batch_neg")
+                s_chunk = rotate_model.score_from_head_emb(anchor_emb, r, cand_1d, conj=conj_flag)
             else:
                 anchor_emb = refiner.refine_anchor(
                     h, rotate_model, nbr_ent, nbr_rel, nbr_dir, nbr_mask, freq
                 )
-                conj_flag = torch.zeros(B, dtype=torch.bool, device=device)
                 s_chunk = rotate_model.score_from_head_emb(anchor_emb, r, cand_1d, conj=conj_flag)
 
             # --- topK maintenance: exclude filtered + exclude gold ---
@@ -397,15 +403,13 @@ def eval_rhs_topk_inject(
             diag["gate_on_sum"] += float(keep.float().sum().item())
             diag["gate_on_den"] += float(B)
 
-        s_gold_total = struct_w * s_gold_struct + delta_ref_gold + (b * g) * s_gold_sem
-        # threshold excludes delta when gold_struct_threshold is on, but keeps sem if enabled
+        # ---- threshold (must exclude delta, must keep sem) ----
+        s_thresh = struct_w * s_gold_struct + (b * g) * s_gold_sem
         if gold_struct_threshold:
             if gold_struct_threshold_no_sem:
-                gold_thr = struct_w * s_gold_struct
+                s_thresh = struct_w * s_gold_struct
             else:
-                gold_thr = struct_w * s_gold_struct + (b * g) * s_gold_sem
-        else:
-            gold_thr = s_gold_total
+                s_thresh = struct_w * s_gold_struct + (b * g) * s_gold_sem
 
         # pass 2: count greater over all entities with threshold s_thresh
         greater_struct = torch.zeros(B, dtype=torch.long, device=device)
@@ -415,16 +419,15 @@ def eval_rhs_topk_inject(
             end = min(start + chunk_size, num_ent)
             cand_1d = all_ent_ids[start:end]
             if refiner is None or use_refiner_rerank:
-                s_chunk_struct = rotate_model(h, r, cand_1d, mode="batch_neg")
+                s_chunk_struct = rotate_model.score_from_head_emb(anchor_emb, r, cand_1d, conj=conj_flag)
             else:
                 anchor_emb = refiner.refine_anchor(
                     h, rotate_model, nbr_ent, nbr_rel, nbr_dir, nbr_mask, freq
                 )
-                conj_flag = torch.zeros(B, dtype=torch.bool, device=device)
                 s_chunk_struct = rotate_model.score_from_head_emb(anchor_emb, r, cand_1d, conj=conj_flag)
             s_chunk = struct_w * s_chunk_struct
 
-            comp = s_chunk > gold_thr.unsqueeze(1)
+            comp = s_chunk > (s_thresh.unsqueeze(1) + score_eps)
             mask = torch.zeros_like(comp, dtype=torch.bool)
             rows, cols = [], []
             for i in range(B):
@@ -457,8 +460,8 @@ def eval_rhs_topk_inject(
         else:
             total_topk = struct_w * top_scores + delta_ref_topk
 
-        greater_struct_topk = (struct_w * top_scores > gold_thr.unsqueeze(1)).sum(dim=1)
-        greater_total_topk = (total_topk > gold_thr.unsqueeze(1)).sum(dim=1)
+        greater_struct_topk = (struct_w * top_scores > (s_thresh.unsqueeze(1) + score_eps)).sum(dim=1)
+        greater_total_topk = (total_topk > (s_thresh.unsqueeze(1) + score_eps)).sum(dim=1)
 
         # diagnostics: topK-only effects
         delta_rank_topk = (greater_total_topk - greater_struct_topk).float()
@@ -466,9 +469,9 @@ def eval_rhs_topk_inject(
         diag["p_improve"] += float((delta_rank_topk < 0).float().mean().item()) * B
         diag["p_hurt"] += float((delta_rank_topk > 0).float().mean().item()) * B
 
-        viol = top_scores > gold_thr.unsqueeze(1)
-        fixed = viol & (total_topk <= gold_thr.unsqueeze(1))
-        broken = (~viol) & (total_topk > gold_thr.unsqueeze(1))
+        viol = top_scores > (s_thresh.unsqueeze(1) + score_eps)
+        fixed = viol & (total_topk <= (s_thresh.unsqueeze(1) + score_eps))
+        broken = (~viol) & (total_topk > (s_thresh.unsqueeze(1) + score_eps))
         diag["fix_num"] += float(fixed.sum().item())
         diag["fix_den"] += float(viol.sum().item())
         diag["break_num"] += float(broken.sum().item())
@@ -575,6 +578,7 @@ def eval_lhs_topk_inject(
     delta_gate_ent_q=None,
     refiner_viol_only=False,
     refiner_topm=0,
+    score_eps=0.0,
     collect_ranks=False,
     profile_time=False,
     refiner_diag=False,
@@ -618,15 +622,15 @@ def eval_lhs_topk_inject(
         use_refiner_rerank = refiner is not None and hasattr(refiner, "score_delta_topk")
 
         struct_w = float(struct_weight)
-        # gold total
+        # gold total (align scoring path with full-entity eval)
+        conj_flag = torch.ones(B, dtype=torch.bool, device=device)
         if refiner is None or use_refiner_rerank:
-            s_gold_struct = rotate_model.score_head_batch(r, t, h.unsqueeze(1)).squeeze(1)
+            anchor_emb = rotate_model.entity_embedding[t]
         else:
             anchor_emb = refiner.refine_anchor(
                 t, rotate_model, nbr_ent, nbr_rel, nbr_dir, nbr_mask, freq
             )
-            conj_flag = torch.ones(B, dtype=torch.bool, device=device)
-            s_gold_struct = rotate_model.score_from_head_emb(anchor_emb, r, h.unsqueeze(1), conj=conj_flag).squeeze(1)
+        s_gold_struct = rotate_model.score_from_head_emb(anchor_emb, r, h.unsqueeze(1), conj=conj_flag).squeeze(1)
 
         if use_sem:
             if profile_time:
@@ -669,12 +673,11 @@ def eval_lhs_topk_inject(
 
             # struct scores for this chunk: [B,C]
             if refiner is None or use_refiner_rerank:
-                s_chunk_struct = rotate_model.score_head_batch(r, t, cand_1d)
+                s_chunk_struct = rotate_model.score_from_head_emb(anchor_emb, r, cand_1d, conj=conj_flag)
             else:
                 anchor_emb = refiner.refine_anchor(
                     t, rotate_model, nbr_ent, nbr_rel, nbr_dir, nbr_mask, freq
                 )
-                conj_flag = torch.ones(B, dtype=torch.bool, device=device)
                 s_chunk_struct = rotate_model.score_from_head_emb(anchor_emb, r, cand_1d, conj=conj_flag)
 
             # --- topK maintenance: exclude filtered + exclude gold ---
@@ -852,15 +855,13 @@ def eval_lhs_topk_inject(
             keep = torch.arange(top_scores.size(1), device=device).unsqueeze(0) < m
             delta_ref_topk = delta_ref_topk * keep.to(delta_ref_topk.dtype)
 
-        s_gold_total = struct_w * s_gold_struct + delta_ref_gold + (b * g) * s_gold_sem
-        # threshold excludes delta when gold_struct_threshold is on, but keeps sem if enabled
+        # ---- threshold (must exclude delta, must keep sem) ----
+        s_thresh = struct_w * s_gold_struct + (b * g) * s_gold_sem
         if gold_struct_threshold:
             if gold_struct_threshold_no_sem:
-                gold_thr = struct_w * s_gold_struct
+                s_thresh = struct_w * s_gold_struct
             else:
-                gold_thr = struct_w * s_gold_struct + (b * g) * s_gold_sem
-        else:
-            gold_thr = s_gold_total
+                s_thresh = struct_w * s_gold_struct + (b * g) * s_gold_sem
 
         # pass 2: count greater over all entities with threshold s_thresh
         greater_struct = torch.zeros(B, dtype=torch.long, device=device)
@@ -870,15 +871,14 @@ def eval_lhs_topk_inject(
             end = min(start + chunk_size, num_ent)
             cand_1d = all_ent_ids[start:end]
             if refiner is None or use_refiner_rerank:
-                s_chunk_struct = rotate_model.score_head_batch(r, t, cand_1d)
+                s_chunk_struct = rotate_model.score_from_head_emb(anchor_emb, r, cand_1d, conj=conj_flag)
             else:
                 anchor_emb = refiner.refine_anchor(
                     t, rotate_model, nbr_ent, nbr_rel, nbr_dir, nbr_mask, freq
                 )
-                conj_flag = torch.ones(B, dtype=torch.bool, device=device)
                 s_chunk_struct = rotate_model.score_from_head_emb(anchor_emb, r, cand_1d, conj=conj_flag)
 
-            comp = (struct_w * s_chunk_struct) > gold_thr.unsqueeze(1)
+            comp = (struct_w * s_chunk_struct) > (s_thresh.unsqueeze(1) + score_eps)
             mask = torch.zeros_like(comp, dtype=torch.bool)
             rows, cols = [], []
             for i in range(B):
@@ -911,8 +911,8 @@ def eval_lhs_topk_inject(
         else:
             total_topk = struct_w * top_scores + delta_ref_topk
 
-        greater_struct_topk = (struct_w * top_scores > gold_thr.unsqueeze(1)).sum(dim=1)
-        greater_total_topk = (total_topk > gold_thr.unsqueeze(1)).sum(dim=1)
+        greater_struct_topk = (struct_w * top_scores > (s_thresh.unsqueeze(1) + score_eps)).sum(dim=1)
+        greater_total_topk = (total_topk > (s_thresh.unsqueeze(1) + score_eps)).sum(dim=1)
 
         # diagnostics: topK-only effects
         delta_rank_topk = (greater_total_topk - greater_struct_topk).float()
@@ -920,9 +920,9 @@ def eval_lhs_topk_inject(
         diag["p_improve"] += float((delta_rank_topk < 0).float().mean().item()) * B
         diag["p_hurt"] += float((delta_rank_topk > 0).float().mean().item()) * B
 
-        viol = (struct_w * top_scores) > gold_thr.unsqueeze(1)
-        fixed = viol & (total_topk <= gold_thr.unsqueeze(1))
-        broken = (~viol) & (total_topk > gold_thr.unsqueeze(1))
+        viol = (struct_w * top_scores) > (s_thresh.unsqueeze(1) + score_eps)
+        fixed = viol & (total_topk <= (s_thresh.unsqueeze(1) + score_eps))
+        broken = (~viol) & (total_topk > (s_thresh.unsqueeze(1) + score_eps))
         diag["fix_num"] += float(fixed.sum().item())
         diag["fix_den"] += float(viol.sum().item())
         diag["break_num"] += float(broken.sum().item())
@@ -1075,8 +1075,21 @@ def main():
                     help="gate delta by entropy quantile q (e.g., 0.8 keeps top 20%)")
     ap.add_argument("--profile_time", action="store_true",
                     help="profile time breakdown and sem ratio")
+    ap.add_argument("--strict_r0", action="store_true",
+                    help="force strict R0 exact-rank via full-entity eval (no sem/gate/refiner)")
     ap.add_argument("--refiner_diag", action="store_true",
                     help="print refiner diagnostics (flip@K / p_up / p_pair)")
+    ap.add_argument("--score_eps", type=float, default=0.0,
+                    help="epsilon added to s_thresh for stable comparisons (batch-size invariant)")
+    ap.add_argument("--deterministic", action="store_true",
+                    help="enable deterministic algorithms (may reduce speed)")
+    ap.add_argument("--disable_tf32", action="store_true",
+                    help="disable TF32 for matmul/convolution")
+    ap.add_argument("--matmul_precision", type=str, default="highest",
+                    choices=["highest", "high", "medium"],
+                    help="torch float32 matmul precision")
+    ap.add_argument("--seed", type=int, default=42,
+                    help="random seed for evaluation")
     ap.add_argument("--rel_gamma_mode", type=str, default="none",
                     choices=["none", "bucket"],
                     help="apply relation-wise gamma (bucketed by frequency)")
@@ -1097,7 +1110,7 @@ def main():
                     help="if >0, use RotatE topK ∪ Sem topK for LHS candidates")
     ap.add_argument("--emb_dim", type=int, default=1000, help="RotatE embedding dim")
     ap.add_argument("--chunk_size", type=int, default=2048)
-    ap.add_argument("--batch_size", type=int, default=16)
+    ap.add_argument("--batch_size", type=int, default=8)
     ap.add_argument("--num_workers", type=int, default=4)
     ap.add_argument("--bootstrap_samples", type=int, default=0)
     ap.add_argument("--bootstrap_ci", type=float, default=0.95)
@@ -1106,10 +1119,17 @@ def main():
     if args.out_dir is None:
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         args.out_dir = os.path.join("artifacts", f"eval_topk_{ts}")
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     os.makedirs(args.out_dir, exist_ok=True)
     write_run_metadata(args.out_dir, args)
+    setup_reproducibility(
+        deterministic=args.deterministic,
+        disable_tf32=args.disable_tf32,
+        matmul_precision=args.matmul_precision,
+        seed=args.seed,
+        out_dir=args.out_dir,
+        verbose=True,
+    )
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     processor = KGProcessor(args.data_path, max_neighbors=16)
     processor.load_files()
@@ -1234,9 +1254,114 @@ def main():
 
     b_rhs = float(args.b_scale) if args.b_rhs is None else float(args.b_rhs)
     b_lhs = float(args.b_scale) if args.b_lhs is None else float(args.b_lhs)
+    score_eps = float(args.score_eps)
     if sem is None:
         if (abs(b_rhs) > 1e-12) or (abs(b_lhs) > 1e-12) or (args.lhs_union_sem_topk > 0):
             raise ValueError("Sem model required for nonzero b or union candidates. Provide --pretrained_sem.")
+
+    # strict R0: bypass topK-inject logic and use full-entity exact rank
+    is_strict_r0 = (
+        sem is None and gate_model is None and refiner is None and
+        abs(b_rhs) <= 1e-12 and abs(b_lhs) <= 1e-12 and
+        abs(args.refiner_gamma_rhs) <= 1e-12 and abs(args.refiner_gamma_lhs) <= 1e-12 and
+        abs(args.struct_weight_rhs - 1.0) <= 1e-12 and abs(args.struct_weight_lhs - 1.0) <= 1e-12 and
+        not args.gold_struct_threshold and args.lhs_union_sem_topk <= 0 and
+        args.refiner_topm == 0 and not args.refiner_viol_only and
+        args.delta_gate_m12 is None and args.delta_gate_ent is None and args.delta_gate_ent_q is None and
+        args.calib_path is None and args.rel_gamma_mode == "none"
+    )
+    if args.strict_r0:
+        if not is_strict_r0:
+            raise ValueError("--strict_r0 requires pure RotatE with no sem/gate/refiner/delta and zero weights.")
+        if args.bootstrap_samples > 0 or args.paired_bootstrap:
+            raise ValueError("--strict_r0 does not support bootstrap; use topK-inject path instead.")
+
+        split_triplets = processor.valid_triplets if args.eval_split == "valid" else processor.test_triplets
+        strict_loader = DataLoader(
+            TrainDataset(split_triplets),
+            batch_size=args.batch_size,
+            shuffle=False,
+            num_workers=args.num_workers,
+            pin_memory=True,
+        )
+        collect_ranks = args.save_ranks_path is not None
+        if collect_ranks:
+            results, rhs_ranks, lhs_ranks = eval_chunked_bidirectional(
+                processor=processor,
+                rotate_model=rotate,
+                test_loader=strict_loader,
+                device=device,
+                to_skip=to_skip,
+                eval_split=args.eval_split,
+                refiner=None,
+                semres_model=None,
+                ent_text_embs=None,
+                rel_text_embs=None,
+                chunk_size=args.chunk_size,
+                sem_subchunk=256,
+                disable_refiner=True,
+                disable_semres=True,
+                sem_rhs_only=False,
+                sem_lhs_only=False,
+                refiner_topk_only=False,
+                refiner_topk=args.topk,
+                print_sem_stats=False,
+                refiner_diag=False,
+                recall_k=args.topk,
+                rel_bucket_map=None,
+                collect_ranks=True,
+                score_eps=score_eps,
+            )
+        else:
+            results = eval_chunked_bidirectional(
+                processor=processor,
+                rotate_model=rotate,
+                test_loader=strict_loader,
+                device=device,
+                to_skip=to_skip,
+                eval_split=args.eval_split,
+                refiner=None,
+                semres_model=None,
+                ent_text_embs=None,
+                rel_text_embs=None,
+                chunk_size=args.chunk_size,
+                sem_subchunk=256,
+                disable_refiner=True,
+                disable_semres=True,
+                sem_rhs_only=False,
+                sem_lhs_only=False,
+                refiner_topk_only=False,
+                refiner_topk=args.topk,
+                print_sem_stats=False,
+                refiner_diag=False,
+                recall_k=args.topk,
+                rel_bucket_map=None,
+                score_eps=score_eps,
+            )
+
+        metrics = {
+            "split": args.eval_split,
+            "topk": args.topk,
+            "recall_k": args.topk,
+            "rhs": results["rhs"],
+            "lhs": results["lhs"],
+            "avg": {
+                "MRR": 0.5 * (results["rhs"]["total"]["MRR"] + results["lhs"]["total"]["MRR"]),
+                "H1": 0.5 * (results["rhs"]["total"]["H1"] + results["lhs"]["total"]["H1"]),
+                "H3": 0.5 * (results["rhs"]["total"]["H3"] + results["lhs"]["total"]["H3"]),
+                "H10": 0.5 * (results["rhs"]["total"]["H10"] + results["lhs"]["total"]["H10"]),
+                "RecK": 0.5 * (results["rhs"]["total"]["RecK"] + results["lhs"]["total"]["RecK"]),
+            },
+        }
+        metrics_path = os.path.join(args.out_dir, "metrics.json")
+        with open(metrics_path, "w", encoding="utf-8") as f:
+            json.dump(metrics, f, ensure_ascii=False, indent=2)
+        print(f"[Metrics] saved to {metrics_path}")
+        if args.save_ranks_path is not None:
+            os.makedirs(os.path.dirname(args.save_ranks_path), exist_ok=True)
+            torch.save({"rhs_ranks": rhs_ranks, "lhs_ranks": lhs_ranks}, args.save_ranks_path)
+            print(f"[Ranks] saved to {args.save_ranks_path}")
+        return
 
     collect_ranks = (args.bootstrap_samples > 0) or args.paired_bootstrap or (args.save_ranks_path is not None)
     if args.paired_bootstrap and args.bootstrap_samples <= 0:
@@ -1278,6 +1403,7 @@ def main():
             profile_time=args.profile_time,
             refiner_diag=args.refiner_diag,
             struct_weight=args.struct_weight_rhs,
+            score_eps=score_eps,
         )
 
     if args.eval_sides in ["lhs", "both"]:
@@ -1315,7 +1441,8 @@ def main():
             refiner_topm=args.refiner_topm,
             profile_time=args.profile_time,
             refiner_diag=args.refiner_diag,
-            struct_weight=args.struct_weight_rhs,
+            struct_weight=args.struct_weight_lhs,
+            score_eps=score_eps,
         )
 
     if args.eval_sides == "both" and rhs_stats and lhs_stats:

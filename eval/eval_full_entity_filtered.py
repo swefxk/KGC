@@ -17,6 +17,7 @@ from models.semantic_residual import SemanticResidualScorerV2
 from models.semantic_biencoder import SemanticBiEncoderScorer
 from models.struct_refiner import StructRefiner
 from tools.run_meta import write_run_metadata
+from tools.repro import setup_reproducibility
 
 
 # =========================================================
@@ -159,6 +160,8 @@ def eval_chunked_bidirectional(
         refiner_diag=False,
         recall_k=200,
         rel_bucket_map=None,
+        collect_ranks=False,
+        score_eps=0.0,
 ):
     rotate_model.eval()
     if refiner:
@@ -210,6 +213,8 @@ def eval_chunked_bidirectional(
         "rhs": {k: {"mrr": 0.0, "h1": 0, "h3": 0, "h10": 0, "rec": 0, "n": 0} for k in keys},
         "lhs": {k: {"mrr": 0.0, "h1": 0, "h3": 0, "h10": 0, "rec": 0, "n": 0} for k in keys},
     }
+    rhs_ranks = [] if collect_ranks else None
+    lhs_ranks = [] if collect_ranks else None
     rel_stats = None
     if rel_bucket_map is not None:
         rel_keys = ["total", 0, 1, 2, 3]
@@ -359,6 +364,7 @@ def eval_chunked_bidirectional(
                     rel_stats[side][bid]["rec"] += rec_val[mask].sum().item()
                     rel_stats[side][bid]["n"] += int(mask.sum().item())
 
+    score_eps = float(score_eps)
     print(f"Start Bidirectional Evaluation (split={eval_split}, Chunk={chunk_size}, SemSubChunk={sem_subchunk}, Bisect Optimized)...")
     for b_idx, batch in enumerate(test_loader):
         batch = batch.to(device, non_blocking=True)
@@ -449,7 +455,7 @@ def eval_chunked_bidirectional(
                     print(f"[RHS] std_ratio   = {std_ratio:.6f}")
                     print(f"[RHS] range_ratio = {range_ratio:.6f}")
 
-            comp = s_chunk > s_gold.unsqueeze(1)
+            comp = s_chunk > (s_gold.unsqueeze(1) + score_eps)
 
             # build mask for filtered entities (excluding gold)
             mask = torch.zeros_like(comp, dtype=torch.bool)
@@ -489,12 +495,14 @@ def eval_chunked_bidirectional(
 
         if refiner_topk_only:
             top_scores_ref = rotate_model.score_from_head_emb(anchor_ref, r, top_ids, conj=conj_flag)
-            greater_struct_topk = (top_scores > s_gold.unsqueeze(1)).sum(dim=1)
-            greater_ref_topk = (top_scores_ref > s_gold.unsqueeze(1)).sum(dim=1)
+            greater_struct_topk = (top_scores > (s_gold.unsqueeze(1) + score_eps)).sum(dim=1)
+            greater_ref_topk = (top_scores_ref > (s_gold.unsqueeze(1) + score_eps)).sum(dim=1)
             rank = greater - greater_struct_topk + greater_ref_topk + 1
         else:
             rank = greater + 1
         update_stats("rhs", rank, t, r)
+        if collect_ranks:
+            rhs_ranks.append(rank.detach().cpu())
 
         # ======================
         # LHS: predict h
@@ -571,7 +579,7 @@ def eval_chunked_bidirectional(
                     print(f"[LHS] range_ratio = {range_ratio:.6f}")
                     print("\n==========================================================================\n")
 
-            comp = s_chunk > s_gold.unsqueeze(1)
+            comp = s_chunk > (s_gold.unsqueeze(1) + score_eps)
 
             mask = torch.zeros_like(comp, dtype=torch.bool)
             rows, cols = [], []
@@ -608,12 +616,14 @@ def eval_chunked_bidirectional(
 
         if refiner_topk_only:
             top_scores_ref = rotate_model.score_from_head_emb(anchor_ref, r, top_ids, conj=conj_flag)
-            greater_struct_topk = (top_scores > s_gold.unsqueeze(1)).sum(dim=1)
-            greater_ref_topk = (top_scores_ref > s_gold.unsqueeze(1)).sum(dim=1)
+            greater_struct_topk = (top_scores > (s_gold.unsqueeze(1) + score_eps)).sum(dim=1)
+            greater_ref_topk = (top_scores_ref > (s_gold.unsqueeze(1) + score_eps)).sum(dim=1)
             rank = greater - greater_struct_topk + greater_ref_topk + 1
         else:
             rank = greater + 1
         update_stats("lhs", rank, h, r)
+        if collect_ranks:
+            lhs_ranks.append(rank.detach().cpu())
 
         if verbose_every and (b_idx + 1) % verbose_every == 0:
             print(f"Evaluated {b_idx + 1} batches...")
@@ -724,6 +734,8 @@ def eval_chunked_bidirectional(
                   f"mean={mean_v:.6f} p90={_q(vals, 0.9):.6f} p99={_q(vals, 0.99):.6f}")
         print(f"[RefinerDiag][Full] p_up={p_up:.4f}")
 
+    if collect_ranks:
+        return results, torch.cat(rhs_ranks, dim=0), torch.cat(lhs_ranks, dim=0)
     return results
 
 
@@ -754,6 +766,8 @@ def main():
     parser.add_argument("--eval_split", type=str, default="test", choices=["valid", "test"])
     parser.add_argument("--out_dir", type=str, default=None)
     parser.add_argument("--recall_k", type=int, default=200)
+    parser.add_argument("--save_ranks_path", type=str, default=None,
+                        help="optional path to save per-query RHS/LHS ranks (for consistency checks)")
     parser.add_argument("--rel_bucket_map", type=str, default=None,
                         help="Path to relation_type_map.json for 1-1/1-N/N-1/N-N bucket stats")
 
@@ -767,14 +781,33 @@ def main():
     parser.add_argument("--chunk_size", type=int, default=2048)
     parser.add_argument("--sem_subchunk", type=int, default=256)
     parser.add_argument("--num_workers", type=int, default=4)
+    parser.add_argument("--score_eps", type=float, default=0.0,
+                        help="epsilon added to s_gold for stable comparisons (batch-size invariant)")
+    parser.add_argument("--deterministic", action="store_true",
+                        help="enable deterministic algorithms (may reduce speed)")
+    parser.add_argument("--disable_tf32", action="store_true",
+                        help="disable TF32 for matmul/convolution")
+    parser.add_argument("--matmul_precision", type=str, default="highest",
+                        choices=["highest", "high", "medium"],
+                        help="torch float32 matmul precision")
+    parser.add_argument("--seed", type=int, default=42,
+                        help="random seed for evaluation")
 
     args = parser.parse_args()
     if args.out_dir is None:
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         args.out_dir = os.path.join("artifacts", f"eval_full_{ts}")
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     os.makedirs(args.out_dir, exist_ok=True)
     write_run_metadata(args.out_dir, args)
+    setup_reproducibility(
+        deterministic=args.deterministic,
+        disable_tf32=args.disable_tf32,
+        matmul_precision=args.matmul_precision,
+        seed=args.seed,
+        out_dir=args.out_dir,
+        verbose=True,
+    )
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"=== Bidirectional Evaluation on {device} (split={args.eval_split}) ===")
 
     processor = KGProcessor(args.data_path, max_neighbors=args.K)
@@ -857,30 +890,60 @@ def main():
         pin_memory=True
     )
 
-    results = eval_chunked_bidirectional(
-        processor=processor,
-        rotate_model=rotate_model,
-        test_loader=test_loader,
-        device=device,
-        to_skip=to_skip,
-        eval_split=args.eval_split,
-        refiner=refiner,
-        semres_model=semres_model,
-        ent_text_embs=ent_embs,
-        rel_text_embs=rel_embs,
-        chunk_size=args.chunk_size,
-        sem_subchunk=args.sem_subchunk,
-        disable_refiner=args.disable_refiner,
-        disable_semres=args.disable_semres,
-        sem_rhs_only=args.sem_rhs_only,
-        sem_lhs_only=args.sem_lhs_only,
-        refiner_topk_only=args.refiner_topk_only,
-        refiner_topk=args.refiner_topk,
-        print_sem_stats=args.print_sem_stats,
-        refiner_diag=args.refiner_diag,
-        recall_k=args.recall_k,
-        rel_bucket_map=rel_bucket_map,
-    )
+    collect_ranks = args.save_ranks_path is not None
+    if collect_ranks:
+        results, rhs_ranks, lhs_ranks = eval_chunked_bidirectional(
+            processor=processor,
+            rotate_model=rotate_model,
+            test_loader=test_loader,
+            device=device,
+            to_skip=to_skip,
+            eval_split=args.eval_split,
+            refiner=refiner,
+            semres_model=semres_model,
+            ent_text_embs=ent_embs,
+            rel_text_embs=rel_embs,
+            chunk_size=args.chunk_size,
+            sem_subchunk=args.sem_subchunk,
+            disable_refiner=args.disable_refiner,
+            disable_semres=args.disable_semres,
+            sem_rhs_only=args.sem_rhs_only,
+            sem_lhs_only=args.sem_lhs_only,
+            refiner_topk_only=args.refiner_topk_only,
+            refiner_topk=args.refiner_topk,
+            print_sem_stats=args.print_sem_stats,
+            refiner_diag=args.refiner_diag,
+            recall_k=args.recall_k,
+            rel_bucket_map=rel_bucket_map,
+            collect_ranks=True,
+        score_eps=args.score_eps,
+        )
+    else:
+        results = eval_chunked_bidirectional(
+            processor=processor,
+            rotate_model=rotate_model,
+            test_loader=test_loader,
+            device=device,
+            to_skip=to_skip,
+            eval_split=args.eval_split,
+            refiner=refiner,
+            semres_model=semres_model,
+            ent_text_embs=ent_embs,
+            rel_text_embs=rel_embs,
+            chunk_size=args.chunk_size,
+            sem_subchunk=args.sem_subchunk,
+            disable_refiner=args.disable_refiner,
+            disable_semres=args.disable_semres,
+            sem_rhs_only=args.sem_rhs_only,
+            sem_lhs_only=args.sem_lhs_only,
+            refiner_topk_only=args.refiner_topk_only,
+            refiner_topk=args.refiner_topk,
+            print_sem_stats=args.print_sem_stats,
+            refiner_diag=args.refiner_diag,
+            recall_k=args.recall_k,
+            rel_bucket_map=rel_bucket_map,
+        score_eps=args.score_eps,
+        )
 
     # save metrics.json
     metrics = {
@@ -900,6 +963,11 @@ def main():
     with open(metrics_path, "w", encoding="utf-8") as f:
         json.dump(metrics, f, ensure_ascii=False, indent=2)
     print(f"[Metrics] saved to {metrics_path}")
+
+    if args.save_ranks_path is not None:
+        os.makedirs(os.path.dirname(args.save_ranks_path), exist_ok=True)
+        torch.save({"rhs_ranks": rhs_ranks, "lhs_ranks": lhs_ranks}, args.save_ranks_path)
+        print(f"[Ranks] saved to {args.save_ranks_path}")
 
 
 if __name__ == "__main__":

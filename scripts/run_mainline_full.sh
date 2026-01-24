@@ -5,28 +5,31 @@ set -euo pipefail
 # Mainline Repro Script
 # =========================
 # Usage:
-#   bash scripts/run_mainline_full.sh fb15k_custom
+#   bash scripts/run_mainline_full.sh fb15k_custom <run_id> [recall_k] [start_step]
 #
 # Run from repo root. This script does NOT download datasets.
 
 DATASET_NAME="${1:-fb15k_custom}"
-RECALL_K="${2:-200}"
-START_STEP="${3:-1}"  # set to 3 to resume from Bi-Encoder
+RUN_ID="${2:-mainline_${DATASET_NAME}}"
+RECALL_K="${3:-200}"
+START_STEP="${4:-1}"  # set to 3 to resume from Bi-Encoder
 DATA_PATH="data/${DATASET_NAME}"
 
-# ---- checkpoint dirs ----
-CKPT_ROOT="checkpoints/mainline_${DATASET_NAME}"
+# ---- artifact dirs ----
+RUN_ROOT="artifacts/${RUN_ID}"
+CKPT_ROOT="${RUN_ROOT}/checkpoints"
 ROTATE_DIR="${CKPT_ROOT}/rotate"
 SEM_DIR="${CKPT_ROOT}/sem_biencoder"
 GATE_DIR="${CKPT_ROOT}/gate"
 REFINER_DIR="${CKPT_ROOT}/refiner"
 
-mkdir -p "${ROTATE_DIR}" "${SEM_DIR}" "${GATE_DIR}" "${REFINER_DIR}"
+mkdir -p "${RUN_ROOT}" "${ROTATE_DIR}" "${SEM_DIR}" "${GATE_DIR}" "${REFINER_DIR}"
 
 # ---- caches ----
-CACHE_DIR="${DATA_PATH}/cache"
+CACHE_DIR="${RUN_ROOT}/cache"
 RHS_CACHE_TV="${CACHE_DIR}/train_rhs_top500_neg_filtered_trainvalid.pt"
 LHS_CACHE_TV="${CACHE_DIR}/train_lhs_top500_neg_filtered_trainvalid.pt"
+mkdir -p "${CACHE_DIR}"
 
 # ---- model paths ----
 ROTATE_CKPT="${ROTATE_DIR}/best_model.pth"
@@ -51,7 +54,7 @@ if [ "${START_STEP}" -le 1 ]; then
     --batch_size 1024 \
     --num_neg 256 \
     --lr 1e-4 \
-    --epochs 200 \
+    --epochs 20 \
     --eval_every 10 \
     --eval_split valid \
     --eval_recall_k "${RECALL_K}" \
@@ -90,6 +93,8 @@ python train/train_sem_biencoder.py \
   --train_cache_rhs "${RHS_CACHE_TV}" \
   --train_cache_lhs "${LHS_CACHE_TV}" \
   --save_dir "${SEM_DIR}" \
+  --eval_topk "${TOPK}" \
+  --eval_b_rhs "${B_RHS}" --eval_b_lhs "${B_LHS}" \
   --eval_metric avg \
   --epochs 10
 
@@ -127,4 +132,4 @@ python eval/eval_topk_inject.py \
   --refiner_gamma_rhs "${GAMMA_RHS}" --refiner_gamma_lhs "${GAMMA_LHS}" \
   --bootstrap_samples 2000
 
-echo "Done. Artifacts in: ${CKPT_ROOT}"
+echo "Done. Artifacts in: ${RUN_ROOT}"

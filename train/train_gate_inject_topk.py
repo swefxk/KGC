@@ -397,6 +397,13 @@ def main():
         torch.save({"state_dict": gate.state_dict(), "args": vars(args)}, save_path)
         print(f"Saved gate to {save_path}")
 
+    # save last epoch as gate_best for downstream eval scripts
+    last_path = os.path.join(args.save_dir, f"gate_ep{args.epochs}.pth")
+    best_path = os.path.join(args.save_dir, "gate_best.pth")
+    if os.path.exists(last_path):
+        torch.save(torch.load(last_path, map_location="cpu"), best_path)
+        print(f"Saved gate_best to {best_path}")
+
 
 if __name__ == "__main__":
     main()

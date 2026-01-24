@@ -16,6 +16,7 @@ from data.data_loader import KGProcessor, TrainDataset
 from models.semantic_biencoder import SemanticBiEncoderScorer
 from eval.eval_full_entity_filtered import build_to_skip, load_embeddings
 from tools.run_meta import write_run_metadata
+from tools.repro import setup_reproducibility
 
 
 def _tensor_size_mb(t: torch.Tensor) -> float:
@@ -184,6 +185,15 @@ def main():
     ap.add_argument("--batch_size", type=int, default=16)
     ap.add_argument("--num_workers", type=int, default=4)
     ap.add_argument("--out_dir", type=str, default=None)
+    ap.add_argument("--deterministic", action="store_true",
+                    help="enable deterministic algorithms (may reduce speed)")
+    ap.add_argument("--disable_tf32", action="store_true",
+                    help="disable TF32 for matmul/convolution")
+    ap.add_argument("--matmul_precision", type=str, default="highest",
+                    choices=["highest", "high", "medium"],
+                    help="torch float32 matmul precision")
+    ap.add_argument("--seed", type=int, default=42,
+                    help="random seed for evaluation")
     args = ap.parse_args()
 
     if args.out_dir is None:
@@ -191,6 +201,14 @@ def main():
         args.out_dir = os.path.join("artifacts", f"eval_sem_only_{ts}")
     os.makedirs(args.out_dir, exist_ok=True)
     write_run_metadata(args.out_dir, args)
+    setup_reproducibility(
+        deterministic=args.deterministic,
+        disable_tf32=args.disable_tf32,
+        matmul_precision=args.matmul_precision,
+        seed=args.seed,
+        out_dir=args.out_dir,
+        verbose=True,
+    )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"=== Sem-only Full-Entity Evaluation on {device} (split={args.eval_split}) ===")

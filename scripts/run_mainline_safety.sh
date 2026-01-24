@@ -3,12 +3,13 @@ set -euo pipefail
 
 # Safety mainline: identical to run_mainline_full.sh, but enables entropy gating for Delta at eval.
 # Usage:
-#   bash scripts/run_mainline_safety.sh fb15k_custom
+#   bash scripts/run_mainline_safety.sh fb15k_custom <run_id>
 
 DATASET_NAME="${1:-fb15k_custom}"
+RUN_ID="${2:-mainline_${DATASET_NAME}}"
 DATA_PATH="data/${DATASET_NAME}"
 
-CKPT_ROOT="checkpoints/mainline_${DATASET_NAME}"
+CKPT_ROOT="artifacts/${RUN_ID}/checkpoints"
 ROTATE_DIR="${CKPT_ROOT}/rotate"
 SEM_DIR="${CKPT_ROOT}/sem_biencoder"
 GATE_DIR="${CKPT_ROOT}/gate"
