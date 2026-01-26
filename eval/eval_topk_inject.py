@@ -25,6 +25,7 @@ from models.semantic_biencoder import SemanticBiEncoderScorer
 from models.struct_refiner import StructRefiner
 from models.gate_injector import ConfidenceGate
 from models.gate_injector import gate_features_from_top_scores
+from models.semantic_confidence import SemanticConfidenceNet
 from tools.run_meta import write_run_metadata
 from tools.repro import setup_reproducibility
 
@@ -66,6 +67,24 @@ def load_calibrator(calib_path, num_relations, device, calib_b_max=None):
 
 
 @torch.no_grad()
+def sem_encode_query_rhs(sem_model, ent_embs, rel_embs, h, r):
+    h_txt = ent_embs[h]
+    r_txt = rel_embs[r]
+    return sem_model.encode_query(h_txt, r_txt, dir_ids=torch.zeros_like(h))
+
+
+def sem_encode_query_lhs(sem_model, ent_embs, rel_embs, t, r):
+    t_txt = ent_embs[t]
+    r_txt = rel_embs[r]
+    return sem_model.encode_query(t_txt, r_txt, dir_ids=torch.ones_like(t))
+
+
+def sem_score_with_q0(sem_model, ent_embs, q0, cand_ids):
+    B, K = cand_ids.shape
+    v = sem_model.encode_entity(ent_embs[cand_ids.reshape(-1)]).view(B, K, -1)
+    return torch.einsum("bd,bkd->bk", q0, v)
+
+
 def sem_score_rhs_biencoder(sem_model, ent_embs, rel_embs, h, r, cand_t_2d):
     """
     h,r: [B]
@@ -73,21 +92,14 @@ def sem_score_rhs_biencoder(sem_model, ent_embs, rel_embs, h, r, cand_t_2d):
     return sem scores [B,K]
     """
     B, K = cand_t_2d.shape
-    h_txt = ent_embs[h]
-    r_txt = rel_embs[r]
-    q = sem_model.encode_query(h_txt, r_txt, dir_ids=torch.zeros_like(h))  # [B,d]
-    v = sem_model.encode_entity(ent_embs[cand_t_2d.reshape(-1)]).view(B, K, -1)
-    return torch.einsum("bd,bkd->bk", q, v)
+    q0 = sem_encode_query_rhs(sem_model, ent_embs, rel_embs, h, r)
+    return sem_score_with_q0(sem_model, ent_embs, q0, cand_t_2d)
 
 
 @torch.no_grad()
 def sem_score_rhs_biencoder_pos(sem_model, ent_embs, rel_embs, h, r, t):
-    h_txt = ent_embs[h]
-    r_txt = rel_embs[r]
-    t_txt = ent_embs[t]
-    q = sem_model.encode_query(h_txt, r_txt, dir_ids=torch.zeros_like(h))
-    v = sem_model.encode_entity(t_txt)
-    return (q * v).sum(dim=-1)  # [B]
+    q0 = sem_encode_query_rhs(sem_model, ent_embs, rel_embs, h, r)
+    return sem_score_with_q0(sem_model, ent_embs, q0, t.unsqueeze(1)).squeeze(1)
 
 
 @torch.no_grad()
@@ -98,21 +110,14 @@ def sem_score_lhs_biencoder(sem_model, ent_embs, rel_embs, t, r, cand_h_2d):
     return sem scores [B,K]
     """
     B, K = cand_h_2d.shape
-    t_txt = ent_embs[t]
-    r_txt = rel_embs[r]
-    q = sem_model.encode_query(t_txt, r_txt, dir_ids=torch.ones_like(t))  # [B,d]
-    v = sem_model.encode_entity(ent_embs[cand_h_2d.reshape(-1)]).view(B, K, -1)
-    return torch.einsum("bd,bkd->bk", q, v)
+    q0 = sem_encode_query_lhs(sem_model, ent_embs, rel_embs, t, r)
+    return sem_score_with_q0(sem_model, ent_embs, q0, cand_h_2d)
 
 
 @torch.no_grad()
 def sem_score_lhs_biencoder_pos(sem_model, ent_embs, rel_embs, t, r, h):
-    t_txt = ent_embs[t]
-    r_txt = rel_embs[r]
-    h_txt = ent_embs[h]
-    q = sem_model.encode_query(t_txt, r_txt, dir_ids=torch.ones_like(t))
-    v = sem_model.encode_entity(h_txt)
-    return (q * v).sum(dim=-1)  # [B]
+    q0 = sem_encode_query_lhs(sem_model, ent_embs, rel_embs, t, r)
+    return sem_score_with_q0(sem_model, ent_embs, q0, h.unsqueeze(1)).squeeze(1)
 
 
 @torch.no_grad()
@@ -149,9 +154,15 @@ def eval_rhs_topk_inject(
     refiner_topm=0,
     score_eps=0.0,
     collect_ranks=False,
+    collect_r=False,
     profile_time=False,
     refiner_diag=False,
     struct_weight=1.0,
+    scn_model=None,
+    scn_topm=10,
+    scn_temp=1.0,
+    scn_in_thresh=True,
+    scn_force_r=None,
 ):
     rotate_model.eval()
     use_sem = sem_model is not None
@@ -176,6 +187,7 @@ def eval_rhs_topk_inject(
             "p_up_num": 0.0, "p_up_den": 0.0,
             "p_pair_sum": 0.0, "p_pair_den": 0.0}
     ranks_all = [] if collect_ranks else None
+    r_all = [] if collect_r else None
     time_stats = {"struct_topk": 0.0, "sem": 0.0, "refiner": 0.0, "pass2": 0.0} if profile_time else None
     time_stats = {"struct_topk": 0.0, "sem": 0.0, "refiner": 0.0, "pass2": 0.0} if profile_time else None
     time_stats = {"struct_topk": 0.0, "sem": 0.0, "refiner": 0.0, "pass2": 0.0} if profile_time else None
@@ -200,10 +212,12 @@ def eval_rhs_topk_inject(
                 h, rotate_model, nbr_ent, nbr_rel, nbr_dir, nbr_mask, freq
             )
         s_gold_struct = rotate_model.score_from_head_emb(anchor_emb, r, t.unsqueeze(1), conj=conj_flag).squeeze(1)
+        q0 = None
         if use_sem:
             if profile_time:
                 t0 = time.time()
-            s_gold_sem = sem_score_rhs_biencoder_pos(sem_model, ent_text_embs, rel_text_embs, h, r, t)  # [B]
+            q0 = sem_encode_query_rhs(sem_model, ent_text_embs, rel_text_embs, h, r)
+            s_gold_sem = sem_score_with_q0(sem_model, ent_text_embs, q0, t.unsqueeze(1)).squeeze(1)  # [B]
             if profile_time:
                 time_stats["sem"] += time.time() - t0
         else:
@@ -403,13 +417,36 @@ def eval_rhs_topk_inject(
             diag["gate_on_sum"] += float(keep.float().sum().item())
             diag["gate_on_den"] += float(B)
 
+        # compute sem_topk + SCN r before threshold so s_thresh stays consistent
+        if use_sem:
+            if profile_time:
+                t0 = time.time()
+            if q0 is None:
+                q0 = sem_encode_query_rhs(sem_model, ent_text_embs, rel_text_embs, h, r)
+            sem_topk = sem_score_with_q0(sem_model, ent_text_embs, q0, top_ids)
+            if scn_model is None:
+                r_sem = torch.ones(B, device=device, dtype=sem_topk.dtype)
+            else:
+                r_sem = scn_model(sem_topk, top_scores, r, torch.zeros_like(h), topm=scn_topm, temp=scn_temp)
+            if scn_force_r is not None:
+                r_sem = torch.full_like(r_sem, float(scn_force_r))
+            if profile_time:
+                time_stats["sem"] += time.time() - t0
+        else:
+            sem_topk = None
+            r_sem = torch.ones(B, device=device, dtype=s_gold_struct.dtype)
+        if collect_r:
+            r_all.append(r_sem.detach().cpu())
+
         # ---- threshold (must exclude delta, must keep sem) ----
-        s_thresh = struct_w * s_gold_struct + (b * g) * s_gold_sem
+        sem_scale_total = b * g * r_sem
+        sem_scale_thresh = b * g * (r_sem if scn_in_thresh else 1.0)
+        s_thresh = struct_w * s_gold_struct + sem_scale_thresh * s_gold_sem
         if gold_struct_threshold:
             if gold_struct_threshold_no_sem:
                 s_thresh = struct_w * s_gold_struct
             else:
-                s_thresh = struct_w * s_gold_struct + (b * g) * s_gold_sem
+                s_thresh = struct_w * s_gold_struct + sem_scale_thresh * s_gold_sem
 
         # pass 2: count greater over all entities with threshold s_thresh
         greater_struct = torch.zeros(B, dtype=torch.long, device=device)
@@ -451,12 +488,7 @@ def eval_rhs_topk_inject(
 
         # correction inside topK: replace struct comparison with total comparison
         if use_sem:
-            if profile_time:
-                t0 = time.time()
-            sem_topk = sem_score_rhs_biencoder(sem_model, ent_text_embs, rel_text_embs, h, r, top_ids)
-            total_topk = struct_w * top_scores + delta_ref_topk + (b * g).unsqueeze(1) * sem_topk
-            if profile_time:
-                time_stats["sem"] += time.time() - t0
+            total_topk = struct_w * top_scores + delta_ref_topk + sem_scale_total.unsqueeze(1) * sem_topk
         else:
             total_topk = struct_w * top_scores + delta_ref_topk
 
@@ -534,7 +566,8 @@ def eval_rhs_topk_inject(
                   f"sem_ratio={time_stats['sem']/total:.2%}")
 
     if collect_ranks:
-        return stats, torch.cat(ranks_all, dim=0), diag
+        r_values = torch.cat(r_all, dim=0) if collect_r else None
+        return stats, torch.cat(ranks_all, dim=0), diag, r_values
     if diag["rec_den"] > 0:
         print(f"[Recall@K][RHS] recall@{topk}={diag['rec_num'] / max(diag['rec_den'], 1e-6):.4f}")
     if diag["gate_on_den"] > 0:
@@ -543,7 +576,8 @@ def eval_rhs_topk_inject(
         print(f"[RefinerDiag][RHS] flip@K={diag['flip_num'] / max(diag['flip_den'], 1e-6):.4f} "
               f"p_up={diag['p_up_num'] / max(diag['p_up_den'], 1e-6):.4f} "
               f"p_pair={diag['p_pair_sum'] / max(diag['p_pair_den'], 1e-6):.4f}")
-    return stats, None, diag
+    r_values = torch.cat(r_all, dim=0) if collect_r else None
+    return stats, None, diag, r_values
 
 
 @torch.no_grad()
@@ -580,10 +614,16 @@ def eval_lhs_topk_inject(
     refiner_topm=0,
     score_eps=0.0,
     collect_ranks=False,
+    collect_r=False,
     profile_time=False,
     refiner_diag=False,
     sem_union_topk=0,
     struct_weight=1.0,
+    scn_model=None,
+    scn_topm=10,
+    scn_temp=1.0,
+    scn_in_thresh=True,
+    scn_force_r=None,
 ):
     rotate_model.eval()
     use_sem = sem_model is not None
@@ -610,6 +650,7 @@ def eval_lhs_topk_inject(
             "p_up_num": 0.0, "p_up_den": 0.0,
             "p_pair_sum": 0.0, "p_pair_den": 0.0}
     ranks_all = [] if collect_ranks else None
+    r_all = [] if collect_r else None
     time_stats = {"struct_topk": 0.0, "sem": 0.0, "refiner": 0.0, "pass2": 0.0} if profile_time else None
 
     for batch in loader:
@@ -632,10 +673,12 @@ def eval_lhs_topk_inject(
             )
         s_gold_struct = rotate_model.score_from_head_emb(anchor_emb, r, h.unsqueeze(1), conj=conj_flag).squeeze(1)
 
+        q0 = None
         if use_sem:
             if profile_time:
                 t0 = time.time()
-            s_gold_sem = sem_score_lhs_biencoder_pos(sem_model, ent_text_embs, rel_text_embs, t, r, h)  # [B]
+            q0 = sem_encode_query_lhs(sem_model, ent_text_embs, rel_text_embs, t, r)
+            s_gold_sem = sem_score_with_q0(sem_model, ent_text_embs, q0, h.unsqueeze(1)).squeeze(1)  # [B]
             if profile_time:
                 time_stats["sem"] += time.time() - t0
         else:
@@ -855,13 +898,36 @@ def eval_lhs_topk_inject(
             keep = torch.arange(top_scores.size(1), device=device).unsqueeze(0) < m
             delta_ref_topk = delta_ref_topk * keep.to(delta_ref_topk.dtype)
 
+        # compute sem_topk + SCN r before threshold so s_thresh stays consistent
+        if use_sem:
+            if profile_time:
+                t0 = time.time()
+            if q0 is None:
+                q0 = sem_encode_query_lhs(sem_model, ent_text_embs, rel_text_embs, t, r)
+            sem_topk = sem_score_with_q0(sem_model, ent_text_embs, q0, top_ids)
+            if scn_model is None:
+                r_sem = torch.ones(B, device=device, dtype=sem_topk.dtype)
+            else:
+                r_sem = scn_model(sem_topk, top_scores, r, torch.ones_like(t), topm=scn_topm, temp=scn_temp)
+            if scn_force_r is not None:
+                r_sem = torch.full_like(r_sem, float(scn_force_r))
+            if profile_time:
+                time_stats["sem"] += time.time() - t0
+        else:
+            sem_topk = None
+            r_sem = torch.ones(B, device=device, dtype=s_gold_struct.dtype)
+        if collect_r:
+            r_all.append(r_sem.detach().cpu())
+
         # ---- threshold (must exclude delta, must keep sem) ----
-        s_thresh = struct_w * s_gold_struct + (b * g) * s_gold_sem
+        sem_scale_total = b * g * r_sem
+        sem_scale_thresh = b * g * (r_sem if scn_in_thresh else 1.0)
+        s_thresh = struct_w * s_gold_struct + sem_scale_thresh * s_gold_sem
         if gold_struct_threshold:
             if gold_struct_threshold_no_sem:
                 s_thresh = struct_w * s_gold_struct
             else:
-                s_thresh = struct_w * s_gold_struct + (b * g) * s_gold_sem
+                s_thresh = struct_w * s_gold_struct + sem_scale_thresh * s_gold_sem
 
         # pass 2: count greater over all entities with threshold s_thresh
         greater_struct = torch.zeros(B, dtype=torch.long, device=device)
@@ -902,12 +968,7 @@ def eval_lhs_topk_inject(
 
         # correction inside topK: replace struct comparison with total comparison
         if use_sem:
-            if profile_time:
-                t0 = time.time()
-            sem_topk = sem_score_lhs_biencoder(sem_model, ent_text_embs, rel_text_embs, t, r, top_ids)
-            total_topk = struct_w * top_scores + delta_ref_topk + (b * g).unsqueeze(1) * sem_topk
-            if profile_time:
-                time_stats["sem"] += time.time() - t0
+            total_topk = struct_w * top_scores + delta_ref_topk + sem_scale_total.unsqueeze(1) * sem_topk
         else:
             total_topk = struct_w * top_scores + delta_ref_topk
 
@@ -985,7 +1046,8 @@ def eval_lhs_topk_inject(
                   f"sem_ratio={time_stats['sem']/total:.2%}")
 
     if collect_ranks:
-        return stats, torch.cat(ranks_all, dim=0), diag
+        r_values = torch.cat(r_all, dim=0) if collect_r else None
+        return stats, torch.cat(ranks_all, dim=0), diag, r_values
     if diag["rec_den"] > 0:
         if sem_union_topk and sem_union_topk > 0:
             base_rec = diag["rec_num_struct"] / max(diag["rec_den_struct"], 1e-6)
@@ -1000,7 +1062,8 @@ def eval_lhs_topk_inject(
         print(f"[RefinerDiag][LHS] flip@K={diag['flip_num'] / max(diag['flip_den'], 1e-6):.4f} "
               f"p_up={diag['p_up_num'] / max(diag['p_up_den'], 1e-6):.4f} "
               f"p_pair={diag['p_pair_sum'] / max(diag['p_pair_den'], 1e-6):.4f}")
-    return stats, None, diag
+    r_values = torch.cat(r_all, dim=0) if collect_r else None
+    return stats, None, diag, r_values
 
 
 def load_sem_model(ckpt_path, text_dim, num_relations, device):
@@ -1035,6 +1098,7 @@ def main():
 
     ap.add_argument("--pretrained_rotate", type=str, required=True)
     ap.add_argument("--pretrained_sem", type=str, default=None)
+    ap.add_argument("--pretrained_scn", type=str, default=None)
     ap.add_argument("--pretrained_refiner", type=str, default=None)
     ap.add_argument("--K", type=int, default=16)
     ap.add_argument("--eval_sides", type=str, default="rhs", choices=["rhs", "lhs", "both"])
@@ -1046,6 +1110,30 @@ def main():
     ap.add_argument("--gate_g_max", type=float, default=2.0)
     ap.add_argument("--gate_init_bias", type=float, default=0.5413)
     ap.add_argument("--gate_ent_temp", type=float, default=1.0)
+
+    ap.add_argument("--scn_rel_dim", type=int, default=32)
+    ap.add_argument("--scn_dir_dim", type=int, default=8)
+    ap.add_argument("--scn_hidden_dim", type=int, default=64)
+    ap.add_argument("--scn_dropout", type=float, default=0.1)
+    ap.add_argument("--scn_r_min", type=float, default=0.05)
+    ap.add_argument("--scn_r_max", type=float, default=0.95)
+    ap.add_argument("--scn_topm", type=int, default=10)
+    ap.add_argument("--scn_temp", type=float, default=1.0)
+    ap.add_argument("--scn_force_r", type=float, default=None,
+                    help="sanity: override r(q) with a constant value (e.g., 1.0 or 0.0)")
+    ap.add_argument(
+        "--scn_in_thresh",
+        dest="scn_in_thresh",
+        action="store_true",
+        help="include r in threshold (default)",
+    )
+    ap.add_argument(
+        "--no_scn_in_thresh",
+        dest="scn_in_thresh",
+        action="store_false",
+        help="exclude r from threshold (A variant)",
+    )
+    ap.set_defaults(scn_in_thresh=True)
 
     ap.add_argument("--calib_path", type=str, default=None)
     ap.add_argument("--calib_b_max", type=float, default=None)
@@ -1098,6 +1186,8 @@ def main():
     ap.add_argument("--rel_gamma_tail", type=float, default=1.0)
     ap.add_argument("--save_ranks_path", type=str, default=None,
                     help="optional path to save per-query RHS/LHS ranks for paired bootstrap")
+    ap.add_argument("--save_r_path", type=str, default=None,
+                    help="optional path to save per-query SCN r values (rhs/lhs)")
     ap.add_argument("--paired_bootstrap", action="store_true",
                     help="compute paired bootstrap ΔMRR using baseline ranks")
     ap.add_argument("--paired_baseline_ranks", type=str, default=None,
@@ -1185,6 +1275,19 @@ def main():
         ent_embs = rel_embs = None
         sem = None
 
+    scn_model = None
+    if args.pretrained_scn:
+        if sem is None:
+            raise ValueError("--pretrained_scn requires --pretrained_sem")
+        scn_ckpt = torch.load(args.pretrained_scn, map_location="cpu")
+        if not isinstance(scn_ckpt, dict) or scn_ckpt.get("model_type", "") != "scn":
+            raise ValueError("Expected SCN checkpoint with model_type='scn'.")
+        cfg = scn_ckpt["model_args"]
+        scn_model = SemanticConfidenceNet(**cfg).to(device)
+        scn_model.load_state_dict(scn_ckpt["state_dict"], strict=True)
+        scn_model.eval()
+        print(f"[SCN] Loaded: {args.pretrained_scn}")
+
     gate_model = None
     if args.pretrained_gate:
         gate_model = ConfidenceGate(
@@ -1243,14 +1346,16 @@ def main():
     using_refiner = refiner is not None
     using_sem = sem is not None
     using_gate = gate_model is not None
+    using_scn = scn_model is not None
     gold_mode = "STRUCT" if args.gold_struct_threshold else "TOTAL"
     print(f"[Mode] using_refiner={using_refiner} refiner_ckpt={args.pretrained_refiner}")
-    print(f"[Mode] using_sem={using_sem} using_gate={using_gate}")
+    print(f"[Mode] using_sem={using_sem} using_gate={using_gate} using_scn={using_scn}")
     print(f"[Mode] gamma_rhs={args.refiner_gamma_rhs} gamma_lhs={args.refiner_gamma_lhs} gold_threshold_mode={gold_mode}")
 
     rhs_stats = lhs_stats = None
     rhs_ranks = lhs_ranks = None
     rhs_diag = lhs_diag = None
+    rhs_r_values = lhs_r_values = None
 
     b_rhs = float(args.b_scale) if args.b_rhs is None else float(args.b_rhs)
     b_lhs = float(args.b_scale) if args.b_lhs is None else float(args.b_lhs)
@@ -1364,11 +1469,12 @@ def main():
         return
 
     collect_ranks = (args.bootstrap_samples > 0) or args.paired_bootstrap or (args.save_ranks_path is not None)
+    collect_r = args.save_r_path is not None
     if args.paired_bootstrap and args.bootstrap_samples <= 0:
         raise ValueError("--paired_bootstrap requires --bootstrap_samples > 0")
 
     if args.eval_sides in ["rhs", "both"]:
-        rhs_stats, rhs_ranks, rhs_diag = eval_rhs_topk_inject(
+        rhs_stats, rhs_ranks, rhs_diag, rhs_r_values = eval_rhs_topk_inject(
             processor=processor,
             rotate_model=rotate,
             sem_model=sem,
@@ -1391,6 +1497,7 @@ def main():
             b_scale=b_rhs,
             get_b_fn=get_b_fn,
             collect_ranks=collect_ranks,
+            collect_r=collect_r,
             refiner_gamma=args.refiner_gamma_rhs,
             gamma_by_rel=gamma_by_rel,
             gold_struct_threshold=args.gold_struct_threshold,
@@ -1404,10 +1511,15 @@ def main():
             refiner_diag=args.refiner_diag,
             struct_weight=args.struct_weight_rhs,
             score_eps=score_eps,
+            scn_model=scn_model,
+            scn_topm=args.scn_topm,
+            scn_temp=args.scn_temp,
+            scn_in_thresh=args.scn_in_thresh,
+            scn_force_r=args.scn_force_r,
         )
 
     if args.eval_sides in ["lhs", "both"]:
-        lhs_stats, lhs_ranks, lhs_diag = eval_lhs_topk_inject(
+        lhs_stats, lhs_ranks, lhs_diag, lhs_r_values = eval_lhs_topk_inject(
             processor=processor,
             rotate_model=rotate,
             sem_model=sem,
@@ -1430,6 +1542,7 @@ def main():
             b_scale=b_lhs,
             get_b_fn=get_b_fn,
             collect_ranks=collect_ranks,
+            collect_r=collect_r,
             refiner_gamma=args.refiner_gamma_lhs,
             gamma_by_rel=gamma_by_rel,
             gold_struct_threshold=args.gold_struct_threshold,
@@ -1443,6 +1556,11 @@ def main():
             refiner_diag=args.refiner_diag,
             struct_weight=args.struct_weight_lhs,
             score_eps=score_eps,
+            scn_model=scn_model,
+            scn_topm=args.scn_topm,
+            scn_temp=args.scn_temp,
+            scn_in_thresh=args.scn_in_thresh,
+            scn_force_r=args.scn_force_r,
         )
 
     if args.eval_sides == "both" and rhs_stats and lhs_stats:
@@ -1573,6 +1691,17 @@ def main():
     if args.save_ranks_path and args.eval_sides == "both" and rhs_ranks is not None and lhs_ranks is not None:
         torch.save({"rhs_ranks": rhs_ranks.cpu(), "lhs_ranks": lhs_ranks.cpu()}, args.save_ranks_path)
         print(f"[Ranks] saved to {args.save_ranks_path}")
+
+    # optional save SCN r values for sanity checks
+    if args.save_r_path and (rhs_r_values is not None or lhs_r_values is not None):
+        os.makedirs(os.path.dirname(args.save_r_path), exist_ok=True)
+        obj = {}
+        if rhs_r_values is not None:
+            obj["rhs_r"] = rhs_r_values.cpu()
+        if lhs_r_values is not None:
+            obj["lhs_r"] = lhs_r_values.cpu()
+        torch.save(obj, args.save_r_path)
+        print(f"[SCN] r values saved to {args.save_r_path}")
 
     # paired bootstrap (ΔMRR)
     if args.paired_bootstrap and args.eval_sides == "both":

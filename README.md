@@ -101,15 +101,30 @@ python scripts/run_mainline.py --dataset fb15k_custom
 | RotatE@TopK (strict) | 0.3075 | 0.2030 | 0.3521 | 0.5126 | 0.8363 |
 | Sem-only strong@TopK | 0.2190 | 0.1445 | 0.2283 | 0.3607 | 0.8363 |
 | C: Sem+Gate | 0.3204 | 0.2245 | 0.3564 | 0.5136 | 0.8363 |
+| C+SCN: Sem+Gate+r | 0.3730 | 0.2794 | 0.4104 | 0.5613 | 0.8363 |
 | D: Sem+Gate+Δ | 0.3599 | 0.2728 | 0.3922 | 0.5367 | 0.8363 |
+| D+SCN: Sem+Gate+r+Δ | 0.4016 | 0.3173 | 0.4340 | 0.5717 | 0.8363 |
 | Safety: entropy q=0.6 | 0.3361 | 0.2408 | 0.3733 | 0.5282 | 0.8363 |
 Interpretation: D should surpass the strongest single-model baseline under the same system protocol (best-of RotatE@TopK or Sem-only@TopK), and be compared directly against C.
+
+SCN (Semantic Confidence Net) is a query-level semantic reliability r(q) that scales semantic injection: s_inj = b * g * r * s_sem. Rec@200 is unchanged, indicating gains come from reranking quality.
 
 ### Paired Bootstrap (system protocol)
 - C − RotatE@TopK: 0.0129 (95% CI [0.0121, 0.0138])
 - D − RotatE@TopK: 0.0525 (95% CI [0.0504, 0.0547])
 - C − Sem-only strong@TopK: 0.1014 (95% CI [0.0981, 0.1047])
 - D − C: 0.0396 (95% CI [0.0375, 0.0416])
+
+### Ablation Chain (no-sem sanity, run_id=200, test)
+说明：每一行都是同一评测口径下的独立设置（非累积训练）。`r=0 & in-thresh` 会关闭语义注入；当 `gamma=0` 时退化为 `R0@TopK`。
+| Step | Setting | AVG MRR | H@1 | H@3 | H@10 | Rec@200 |
+|---|---|---|---|---|---|---|
+| 0 | R0@TopK (strict) | 0.3075 | 0.2030 | 0.3521 | 0.5126 | 0.8363 |
+| 1 | Δ-only (r=0, in-thresh, gamma>0) | 0.3446 | 0.2477 | 0.3867 | 0.5333 | 0.8363 |
+| 2 | C: Sem+Gate | 0.3204 | 0.2245 | 0.3564 | 0.5136 | 0.8363 |
+| 3 | C+SCN (A: no r in thresh) | 0.3730 | 0.2794 | 0.4104 | 0.5613 | 0.8363 |
+| 4 | D: Sem+Gate+Δ | 0.3599 | 0.2728 | 0.3922 | 0.5367 | 0.8363 |
+| 5 | D+SCN (A: no r in thresh) | 0.4016 | 0.3173 | 0.4340 | 0.5717 | 0.8363 |
 
 ## Sem-only Ablations
 定义两条口径，表格中务必区分命名：

@@ -51,6 +51,11 @@ g = clip(softplus(MLP([stats, rel_emb, dir_emb]) + init_bias), g_min, g_max)
 s_inj(q,e) = b · g(q) · s_sem(q,e),  e ∈ C_K(q)
 其中 b 可按 RHS/LHS 分别设置，g 是 query 级别的自适应缩放（对该 query 的所有候选共享）。
 
+语义可靠度 SCN（Semantic Confidence Net）
+为刻画“语义是否有益”，我们引入 query 级别可靠度 r(q)∈[0,1]，仅调节语义注入强度，不改变候选间语义相对顺序：
+s_inj(q,e) = b · g(q) · r(q) · s_sem(q,e)
+SCN 仅使用推理可得特征：语义分布统计（mean/std/max/gap/entropy）、语义与结构的 Top‑M 一致性（overlap）、以及关系/方向 embedding。训练采用 union 候选（强制 gold 进 Top‑K）并以“Top‑K 内 rank 改善”作为 query‑level 监督，得到可解释的 r(q)。
+
 候选内残差纠错 Δ（Refiner-R2）
 Refiner 仅在 Top-K 内输出残差项 Δ：
 s_topK(q,e) = struct_w · s_struct(q,e) + s_inj(q,e) + γ · Δ(q,e),  e ∈ C_K(q)
