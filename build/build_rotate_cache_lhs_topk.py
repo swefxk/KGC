@@ -7,7 +7,8 @@ import torch
 sys.path.append(os.getcwd())
 
 from data.data_loader import KGProcessor
-from models.rotate import RotatEModel
+from models.struct_backbone_base import StructBackboneBase
+from models.struct_backbone_factory import load_struct_backbone, resolve_struct_ckpt
 from tools.run_meta import write_run_metadata
 
 
@@ -27,7 +28,7 @@ def build_true_head_sets_trainvalid(processor: KGProcessor):
 
 @torch.no_grad()
 def topk_head_for_batch(
-    rotate_model: RotatEModel,
+    rotate_model: StructBackboneBase,
     h: torch.LongTensor,
     r: torch.LongTensor,
     t: torch.LongTensor,
@@ -89,8 +90,14 @@ def topk_head_for_batch(
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--data_path", type=str, default="data/fb15k_custom")
-    ap.add_argument("--pretrained_rotate", type=str, required=True)
+    ap.add_argument("--struct_type", type=str, default="rotate", choices=["rotate", "complex"])
+    ap.add_argument("--pretrained_struct", type=str, default=None,
+                    help="struct backbone checkpoint (overrides --pretrained_rotate)")
+    ap.add_argument("--pretrained_rotate", type=str, default=None,
+                    help="legacy RotatE checkpoint (struct_type=rotate)")
     ap.add_argument("--K", type=int, default=500)
+    ap.add_argument("--emb_dim", type=int, default=1000, help="struct embedding dim d (entity has 2d)")
+    ap.add_argument("--margin", type=float, default=9.0, help="RotatE margin (ignored by ComplEx)")
     ap.add_argument("--chunk_size", type=int, default=2048)
     ap.add_argument("--batch_size", type=int, default=64)
     ap.add_argument("--use_filtered_trainvalid", action="store_true")
@@ -104,9 +111,18 @@ def main():
     processor = KGProcessor(args.data_path, max_neighbors=16)
     processor.load_files()
 
-    rotate_model = RotatEModel(processor.num_entities, processor.num_relations, emb_dim=1000, margin=9.0).to(device)
-    rotate_model.load_state_dict(torch.load(args.pretrained_rotate, map_location=device))
-    rotate_model.eval()
+    struct_ckpt = resolve_struct_ckpt(args)
+    if struct_ckpt is None:
+        raise ValueError("Missing struct checkpoint: provide --pretrained_struct or --pretrained_rotate.")
+    rotate_model = load_struct_backbone(
+        struct_type=args.struct_type,
+        num_entities=processor.num_entities,
+        num_relations=processor.num_relations,
+        emb_dim=args.emb_dim,
+        margin=args.margin,
+        ckpt_path=struct_ckpt,
+        device=device,
+    )
 
     true_head = build_true_head_sets_trainvalid(processor) if args.use_filtered_trainvalid else None
 

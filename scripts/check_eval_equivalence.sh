@@ -2,20 +2,28 @@
 set -euo pipefail
 
 # Usage:
-#   bash scripts/check_eval_equivalence.sh <run_id> [dataset_name] [topk]
+#   bash scripts/check_eval_equivalence.sh <run_id> [dataset_name] [topk] [struct_type] [emb_dim]
 # Example:
-#   bash scripts/check_eval_equivalence.sh fb15k_custom_main_seed42 fb15k_custom 200
+#   bash scripts/check_eval_equivalence.sh fb15k_custom_main_seed42 fb15k_custom 200 rotate 1000
 
-RUN_ID="${1:?Usage: bash scripts/check_eval_equivalence.sh <run_id> [dataset_name] [topk]}"
+RUN_ID="${1:?Usage: bash scripts/check_eval_equivalence.sh <run_id> [dataset_name] [topk] [struct_type] [emb_dim]}"
 DATASET="${2:-fb15k_custom}"
 TOPK="${3:-200}"
+STRUCT_TYPE="${4:-rotate}"
 
 ROOT="artifacts/${RUN_ID}"
 DATA="data/${DATASET}"
-ROTATE="${ROOT}/checkpoints/rotate/best_model.pth"
+if [ "${STRUCT_TYPE}" = "complex" ]; then
+  STRUCT_CKPT="${ROOT}/checkpoints/complex/best_model.pth"
+  EMB_DIM="${5:-500}"
+else
+  STRUCT_TYPE="rotate"
+  STRUCT_CKPT="${ROOT}/checkpoints/rotate/best_model.pth"
+  EMB_DIM="${5:-1000}"
+fi
 
-if [ ! -f "${ROTATE}" ]; then
-  echo "[Error] Missing RotatE ckpt: ${ROTATE}"
+if [ ! -f "${STRUCT_CKPT}" ]; then
+  echo "[Error] Missing struct ckpt: ${STRUCT_CKPT}"
   exit 1
 fi
 
@@ -33,7 +41,9 @@ run_mode() {
   echo "[Run] mode=${name} (full-entity)"
   python eval/eval_full_entity_filtered.py \
     --data_path "${DATA}" \
-    --pretrained_rotate "${ROTATE}" \
+    --struct_type "${STRUCT_TYPE}" \
+    --pretrained_struct "${STRUCT_CKPT}" \
+    --emb_dim "${EMB_DIM}" \
     --recall_k "${TOPK}" \
     --eval_split test \
     --out_dir "${out_full}" \
@@ -45,7 +55,9 @@ run_mode() {
   echo "[Run] mode=${name} (topK strict)"
   python eval/eval_topk_inject.py \
     --data_path "${DATA}" \
-    --pretrained_rotate "${ROTATE}" \
+    --struct_type "${STRUCT_TYPE}" \
+    --pretrained_struct "${STRUCT_CKPT}" \
+    --emb_dim "${EMB_DIM}" \
     --strict_r0 \
     --topk "${TOPK}" --b_rhs 0.0 --b_lhs 0.0 \
     --eval_split test --eval_sides both \

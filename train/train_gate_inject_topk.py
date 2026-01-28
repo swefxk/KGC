@@ -10,7 +10,7 @@ from torch.utils.data import DataLoader
 sys.path.append(os.getcwd())
 
 from data.data_loader import KGProcessor, TrainDataset
-from models.rotate import RotatEModel
+from models.struct_backbone_factory import load_struct_backbone, resolve_struct_ckpt
 from models.struct_refiner import StructRefiner
 from models.semantic_biencoder import SemanticBiEncoderScorer
 from models.gate_injector import ConfidenceGate, entropy_from_logits
@@ -107,12 +107,17 @@ def save_args(args, save_dir):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--data_path", type=str, default="data/fb15k_custom")
-    ap.add_argument("--pretrained_rotate", type=str, required=True)
+    ap.add_argument("--struct_type", type=str, default="rotate", choices=["rotate", "complex"])
+    ap.add_argument("--pretrained_struct", type=str, default=None,
+                    help="struct backbone checkpoint (overrides --pretrained_rotate)")
+    ap.add_argument("--pretrained_rotate", type=str, default=None,
+                    help="legacy RotatE checkpoint (struct_type=rotate)")
     ap.add_argument("--pretrained_refiner", type=str, default=None)
     ap.add_argument("--pretrained_sem", type=str, required=True)
     ap.add_argument("--train_cache_rhs", type=str, required=True)
     ap.add_argument("--train_cache_lhs", type=str, required=True)
-    ap.add_argument("--emb_dim", type=int, default=1000, help="RotatE embedding dim")
+    ap.add_argument("--emb_dim", type=int, default=1000, help="struct embedding dim d (entity has 2d)")
+    ap.add_argument("--margin", type=float, default=9.0, help="RotatE margin (ignored by ComplEx)")
 
     ap.add_argument("--b_rhs", type=float, default=2.0)
     ap.add_argument("--b_lhs", type=float, default=2.5)
@@ -157,14 +162,18 @@ def main():
         raise ValueError("Cache rows do not match train size.")
 
     # models (frozen)
-    rotate = RotatEModel(
-        processor.num_entities,
-        processor.num_relations,
+    struct_ckpt = resolve_struct_ckpt(args)
+    if struct_ckpt is None:
+        raise ValueError("Missing struct checkpoint: provide --pretrained_struct or --pretrained_rotate.")
+    rotate = load_struct_backbone(
+        struct_type=args.struct_type,
+        num_entities=processor.num_entities,
+        num_relations=processor.num_relations,
         emb_dim=args.emb_dim,
-        margin=9.0,
-    ).to(device)
-    rotate.load_state_dict(torch.load(args.pretrained_rotate, map_location=device))
-    rotate.eval()
+        margin=args.margin,
+        ckpt_path=struct_ckpt,
+        device=device,
+    )
     for p in rotate.parameters():
         p.requires_grad = False
 

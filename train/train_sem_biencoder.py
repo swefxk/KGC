@@ -14,7 +14,7 @@ from torch.utils.data import Dataset, DataLoader
 sys.path.append(os.getcwd())
 
 from data.data_loader import KGProcessor, TrainDataset
-from models.rotate import RotatEModel
+from models.struct_backbone_factory import load_struct_backbone, resolve_struct_ckpt
 from eval.eval_full_entity_filtered import load_embeddings, build_to_skip, eval_chunked_bidirectional
 from eval.eval_sem_biencoder_full import build_sem_index, eval_sem_only
 from eval.eval_topk_inject import eval_rhs_topk_inject, eval_lhs_topk_inject
@@ -164,15 +164,20 @@ def main():
     ap = argparse.ArgumentParser()
 
     ap.add_argument("--data_path", type=str, default="data/fb15k_custom")
-    ap.add_argument("--pretrained_rotate", type=str, default=None)
-    ap.add_argument("--emb_dim", type=int, default=1000, help="RotatE embedding dim")
+    ap.add_argument("--struct_type", type=str, default="rotate", choices=["rotate", "complex"])
+    ap.add_argument("--pretrained_struct", type=str, default=None,
+                    help="struct backbone checkpoint (overrides --pretrained_rotate)")
+    ap.add_argument("--pretrained_rotate", type=str, default=None,
+                    help="legacy RotatE checkpoint (struct_type=rotate)")
+    ap.add_argument("--emb_dim", type=int, default=1000, help="struct embedding dim d (entity has 2d)")
+    ap.add_argument("--margin", type=float, default=9.0, help="RotatE margin (ignored by ComplEx)")
     ap.add_argument("--train_cache", type=str, default=None)  # legacy RHS cache
     ap.add_argument("--train_cache_rhs", type=str, default=None)
     ap.add_argument("--train_cache_lhs", type=str, default=None)
     ap.add_argument("--save_dir", type=str, required=True)
     ap.add_argument("--pretrained_sem", type=str, default=None)
     ap.add_argument("--neg_source", type=str, default="cache", choices=["cache", "random"],
-                    help="negative source: cache (RotatE hard) or random")
+                    help="negative source: cache (struct hard) or random")
     ap.add_argument("--random_lhs", action="store_true",
                     help="if set and neg_source=random, also train LHS with random negatives")
 
@@ -272,7 +277,7 @@ def main():
         raise ValueError(f"RHS cache rows={cache_neg_t.size(0)} != num_train={processor.train_triplets.size(0)}")
     print(f"[Cache] neg_t CPU: {tuple(cache_neg_t.shape)} dtype={cache_neg_t.dtype}")
     else:
-        print("[Cache] neg_source=random (no RotatE cache used)")
+        print("[Cache] neg_source=random (no struct cache used)")
 
     cache_neg_h = None
     if args.train_cache_lhs:
@@ -283,17 +288,19 @@ def main():
             raise ValueError(f"LHS cache rows={cache_neg_h.size(0)} != num_train={processor.train_triplets.size(0)}")
         print(f"[Cache] neg_h CPU: {tuple(cache_neg_h.shape)} dtype={cache_neg_h.dtype}")
 
-    # ---- RotatE (frozen, for eval only) ----
+    # ---- struct backbone (frozen, for eval only) ----
     rotate_model = None
-    if args.pretrained_rotate:
-        rotate_model = RotatEModel(
-            processor.num_entities,
-            processor.num_relations,
+    struct_ckpt = resolve_struct_ckpt(args)
+    if struct_ckpt:
+        rotate_model = load_struct_backbone(
+            struct_type=args.struct_type,
+            num_entities=processor.num_entities,
+            num_relations=processor.num_relations,
             emb_dim=args.emb_dim,
-            margin=9.0,
-        ).to(device)
-    rotate_model.load_state_dict(torch.load(args.pretrained_rotate, map_location=device))
-    rotate_model.eval()
+            margin=args.margin,
+            ckpt_path=struct_ckpt,
+            device=device,
+        )
     for p in rotate_model.parameters():
         p.requires_grad = False
 
@@ -519,7 +526,7 @@ def main():
                     pin_memory=True,
                     drop_last=False,
                 )
-                rhs_stats, _, _ = eval_rhs_topk_inject(
+                rhs_stats, _, _, _ = eval_rhs_topk_inject(
                 processor=processor,
                 rotate_model=rotate_model,
                     sem_model=sem_model,
@@ -555,7 +562,7 @@ def main():
                     refiner_diag=False,
                     struct_weight=args.eval_struct_weight_rhs,
                 )
-                lhs_stats, _, _ = eval_lhs_topk_inject(
+                lhs_stats, _, _, _ = eval_lhs_topk_inject(
                     processor=processor,
                     rotate_model=rotate_model,
                     sem_model=sem_model,
@@ -598,7 +605,7 @@ def main():
                 print(f"[VALID][TopK] RHS={rhs:.4f} | LHS={lhs:.4f} | AVG={avg:.4f}")
                 metric = avg if metric_name == "avg" else rhs
             else:
-                print("[WARN] pretrained_rotate not provided; skipping topK proxy (B).")
+                print("[WARN] struct checkpoint not provided; skipping topK proxy (B).")
 
             # A: sem-only full-entity (ablation evidence)
             run_sem_only = True if rotate_model is None else (

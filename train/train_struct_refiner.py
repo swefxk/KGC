@@ -12,7 +12,7 @@ from torch.utils.data import DataLoader, Dataset
 sys.path.append(os.getcwd())
 
 from data.data_loader import KGProcessor, TrainDataset
-from models.rotate import RotatEModel
+from models.struct_backbone_factory import load_struct_backbone, resolve_struct_ckpt
 from models.struct_refiner import StructRefiner
 from tools.run_meta import write_run_metadata
 
@@ -304,11 +304,15 @@ def eval_refiner_struct_only(
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--data_path", type=str, default="data/fb15k_custom")
-    parser.add_argument("--pretrained_rotate", type=str, required=True)
+    parser.add_argument("--struct_type", type=str, default="rotate", choices=["rotate", "complex"])
+    parser.add_argument("--pretrained_struct", type=str, default=None,
+                        help="struct backbone checkpoint (overrides --pretrained_rotate)")
+    parser.add_argument("--pretrained_rotate", type=str, default=None,
+                        help="legacy RotatE checkpoint (struct_type=rotate)")
     parser.add_argument("--save_dir", type=str, default="checkpoints/struct_refiner")
 
     parser.add_argument("--emb_dim", type=int, default=1000)
-    parser.add_argument("--margin", type=float, default=9.0)
+    parser.add_argument("--margin", type=float, default=9.0, help="RotatE margin (ignored by ComplEx)")
 
     parser.add_argument("--K", type=int, default=16)
     parser.add_argument("--num_neg", type=int, default=64, help="used only for random filtered negatives")
@@ -377,12 +381,21 @@ def main():
     # train-only 真值集合（用于 random filtered negatives）
     true_head_train, true_tail_train = build_true_head_tail_from_train(processor.train_triplets)
 
-    print(f"Loading frozen RotatE from {args.pretrained_rotate}")
-    rotate_model = RotatEModel(processor.num_entities, processor.num_relations, args.emb_dim, args.margin).to(device)
-    rotate_model.load_state_dict(torch.load(args.pretrained_rotate, map_location=device))
+    struct_ckpt = resolve_struct_ckpt(args)
+    if struct_ckpt is None:
+        raise ValueError("Missing struct checkpoint: provide --pretrained_struct or --pretrained_rotate.")
+    print(f"[Struct] type={args.struct_type} ckpt={struct_ckpt}")
+    rotate_model = load_struct_backbone(
+        struct_type=args.struct_type,
+        num_entities=processor.num_entities,
+        num_relations=processor.num_relations,
+        emb_dim=args.emb_dim,
+        margin=args.margin,
+        ckpt_path=struct_ckpt,
+        device=device,
+    )
     for p in rotate_model.parameters():
         p.requires_grad = False
-    rotate_model.eval()
 
     print("Initializing StructRefiner...")
     refiner = StructRefiner(
@@ -504,7 +517,7 @@ def main():
                     torch.zeros(B, dtype=torch.bool, device=device),  # RHS
                     torch.ones(B, dtype=torch.bool, device=device)    # LHS
                 ], dim=0)
-            # base structural scores (RotatE)
+            # base structural scores (struct backbone)
             base_emb = rotate_model.entity_embedding[anchor_ids]
             s_neg_base = rotate_model.score_from_head_emb(base_emb, rel_ids, neg_ids, conj=conj_flag)
             s_pos_base = rotate_model.score_from_head_emb(

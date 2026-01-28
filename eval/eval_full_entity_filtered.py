@@ -11,7 +11,7 @@ import torch.nn.functional as F
 sys.path.append(os.getcwd())
 
 from data.data_loader import KGProcessor, TrainDataset
-from models.rotate import RotatEModel
+from models.struct_backbone_factory import load_struct_backbone, resolve_struct_ckpt
 from models.text_encoder import TextEncoder
 from models.semantic_residual import SemanticResidualScorerV2
 from models.semantic_biencoder import SemanticBiEncoderScorer
@@ -747,7 +747,11 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--data_path", type=str, default="data/fb15k_custom")
 
-    parser.add_argument("--pretrained_rotate", type=str, required=True)
+    parser.add_argument("--struct_type", type=str, default="rotate", choices=["rotate", "complex"])
+    parser.add_argument("--pretrained_struct", type=str, default=None,
+                        help="struct backbone checkpoint (overrides --pretrained_rotate)")
+    parser.add_argument("--pretrained_rotate", type=str, default=None,
+                        help="legacy RotatE checkpoint (struct_type=rotate)")
     parser.add_argument("--pretrained_refiner", type=str, default=None)
     parser.add_argument("--pretrained_semres", type=str, default=None)
 
@@ -758,7 +762,7 @@ def main():
     parser.add_argument("--sem_lhs_only", action="store_true")
     parser.add_argument("--print_sem_stats", action="store_true")
     parser.add_argument("--refiner_topk_only", action="store_true",
-                        help="apply refiner only within topK; full-entity rank uses base RotatE")
+                        help="apply refiner only within topK; full-entity rank uses base struct backbone")
     parser.add_argument("--refiner_topk", type=int, default=500)
     parser.add_argument("--refiner_diag", action="store_true",
                         help="print refiner diagnostics (anchor delta / eta / p_up)")
@@ -836,9 +840,19 @@ def main():
         processor.nbr_mask = processor.nbr_mask.to(device)
         processor.freq = processor.freq.to(device)
 
-    print(f"Loading RotatE: {args.pretrained_rotate}")
-    rotate_model = RotatEModel(processor.num_entities, processor.num_relations, args.emb_dim, args.margin).to(device)
-    rotate_model.load_state_dict(torch.load(args.pretrained_rotate, map_location=device))
+    struct_ckpt = resolve_struct_ckpt(args)
+    if struct_ckpt is None:
+        raise ValueError("Missing struct checkpoint: provide --pretrained_struct or --pretrained_rotate.")
+    print(f"[Struct] type={args.struct_type} ckpt={struct_ckpt}")
+    rotate_model = load_struct_backbone(
+        struct_type=args.struct_type,
+        num_entities=processor.num_entities,
+        num_relations=processor.num_relations,
+        emb_dim=args.emb_dim,
+        margin=args.margin,
+        ckpt_path=struct_ckpt,
+        device=device,
+    )
 
     refiner = None
     if args.pretrained_refiner and not args.disable_refiner:

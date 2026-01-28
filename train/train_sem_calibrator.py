@@ -13,9 +13,10 @@ from torch.utils.data import Dataset, DataLoader
 sys.path.append(os.getcwd())
 
 from data.data_loader import KGProcessor
-from models.rotate import RotatEModel
 from models.semantic_biencoder import SemanticBiEncoderScorer
-from models.semantic_confidence import SemanticConfidenceNet
+from models.experimental.semantic_confidence import SemanticConfidenceNet
+from models.struct_backbone_base import StructBackboneBase
+from models.struct_backbone_factory import load_struct_backbone, resolve_struct_ckpt
 from eval.eval_full_entity_filtered import load_embeddings
 from tools.run_meta import write_run_metadata
 
@@ -123,7 +124,7 @@ def rank_in_topk(scores, gold_index, eps: float):
 def compute_dir_loss(
     scn: SemanticConfidenceNet,
     sem_model: SemanticBiEncoderScorer,
-    rotate_model: RotatEModel,
+    rotate_model: StructBackboneBase,
     ent_embs: torch.Tensor,
     rel_embs: torch.Tensor,
     anchor_ids: torch.Tensor,
@@ -188,14 +189,18 @@ def compute_dir_loss(
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--data_path", type=str, default="data/fb15k_custom")
-    ap.add_argument("--pretrained_rotate", type=str, required=True)
+    ap.add_argument("--struct_type", type=str, default="rotate", choices=["rotate", "complex"])
+    ap.add_argument("--pretrained_struct", type=str, default=None,
+                    help="struct backbone checkpoint (overrides --pretrained_rotate)")
+    ap.add_argument("--pretrained_rotate", type=str, default=None,
+                    help="legacy RotatE checkpoint (struct_type=rotate)")
     ap.add_argument("--pretrained_sem", type=str, required=True)
     ap.add_argument("--train_cache_rhs", type=str, required=True)
     ap.add_argument("--train_cache_lhs", type=str, required=True)
     ap.add_argument("--save_dir", type=str, required=True)
 
     ap.add_argument("--emb_dim", type=int, default=1000)
-    ap.add_argument("--margin", type=float, default=9.0)
+    ap.add_argument("--margin", type=float, default=9.0, help="RotatE margin (ignored by ComplEx)")
     ap.add_argument("--topk", type=int, default=200)
 
     ap.add_argument("--b_rhs", type=float, default=2.0)
@@ -244,14 +249,18 @@ def main():
     if args.topk > cache_neg_t.size(1) or args.topk > cache_neg_h.size(1):
         raise ValueError("--topk exceeds cache K")
 
-    rotate_model = RotatEModel(
-        processor.num_entities,
-        processor.num_relations,
+    struct_ckpt = resolve_struct_ckpt(args)
+    if struct_ckpt is None:
+        raise ValueError("Missing struct checkpoint: provide --pretrained_struct or --pretrained_rotate.")
+    rotate_model = load_struct_backbone(
+        struct_type=args.struct_type,
+        num_entities=processor.num_entities,
+        num_relations=processor.num_relations,
         emb_dim=args.emb_dim,
         margin=args.margin,
-    ).to(device)
-    rotate_model.load_state_dict(torch.load(args.pretrained_rotate, map_location=device))
-    rotate_model.eval()
+        ckpt_path=struct_ckpt,
+        device=device,
+    )
     for p in rotate_model.parameters():
         p.requires_grad = False
 
